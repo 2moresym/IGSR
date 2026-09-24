@@ -8,7 +8,7 @@ pub mod config;
 pub mod context;
 
 pub use backend::{ComputePath, GpuBackend};
-pub use config::{IgsrConfig, QualityMode};
+pub use config::{FrameInputs, IgsrConfig, QualityMode};
 pub use context::IgsrContext;
 
 pub fn version() -> &'static str {

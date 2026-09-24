@@ -1,11 +1,7 @@
 #include "igsr.h"
+#include "igsr_priv.h"
 
 #include <stdlib.h>
-
-struct IgsrContext {
-    IgsrConfig cfg;
-    uint64_t frame_index; /* starts at 1 so Halton never returns (0,0) */
-};
 
 static uint32_t ceil_div(uint32_t a, uint32_t b) { return (a + b - 1u) / b; }
 

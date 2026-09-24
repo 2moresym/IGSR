@@ -1,6 +1,6 @@
 //! RAII context over the C `IgsrContext`.
 
-use crate::config::IgsrConfig;
+use crate::config::{FrameInputs, IgsrConfig};
 use std::ptr::NonNull;
 
 /// Safe owner of the C context. `Send` but not `Sync` (GL contexts are
@@ -85,6 +85,31 @@ impl IgsrContext {
         out
     }
 
+    /// Pack the shader uniform block for this frame. Pure function of the
+    /// config + inputs (computed in the C core so GL and Vireo share it).
+    pub fn frame_params(&self, inputs: &FrameInputs) -> igsr_sys::IgsrParamsFfi {
+        let ffi = inputs.to_ffi();
+        let mut out = igsr_sys::IgsrParamsFfi {
+            render_size: [0.0; 2],
+            display_size: [0.0; 2],
+            render_size_rcp: [0.0; 2],
+            display_size_rcp: [0.0; 2],
+            jitter: [0.0; 2],
+            clip_to_prev_clip: [0.0; 16],
+            pre_exposure: 0.0,
+            camera_fov_hor: 0.0,
+            camera_near: 0.0,
+            min_lerp_contrib: 0.0,
+            same_camera_frames: 0,
+            reset: 0,
+        };
+        // SAFETY: ptr/ffi/out are all live for this call; C only reads/writes them.
+        unsafe {
+            igsr_sys::igsr_fill_params(self.ptr.as_ptr(), &ffi, &mut out);
+        }
+        out
+    }
+
     /// Stage 1 stub. Full `.upscale(inputs) -> Texture` lands in stages 3–4
     /// once the reimplemented GLSL + GL dispatch exist.
     pub fn upscale_stub(&self) -> &'static str {
@@ -96,5 +121,79 @@ impl Drop for IgsrContext {
     fn drop(&mut self) {
         // SAFETY: ptr was returned by igsr_create and not yet freed.
         unsafe { igsr_sys::igsr_destroy(self.ptr.as_ptr()) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::QualityMode;
+
+    fn test_ctx() -> IgsrContext {
+        let cfg = IgsrConfig::from_display(1280, 720, QualityMode::Balanced);
+        IgsrContext::new(cfg).unwrap()
+    }
+
+    #[test]
+    fn params_pack_sizes_and_rcps() {
+        let ctx = test_ctx();
+        let p = ctx.frame_params(&FrameInputs::reset_frame());
+        assert_eq!(p.render_size, [755.0, 424.0]);
+        assert_eq!(p.display_size, [1280.0, 720.0]);
+        assert!((p.render_size_rcp[0] - 1.0 / 755.0).abs() < 1e-7);
+        assert!((p.render_size_rcp[1] - 1.0 / 424.0).abs() < 1e-7);
+        assert!((p.display_size_rcp[0] - 1.0 / 1280.0).abs() < 1e-9);
+        assert_eq!(p.reset, 1);
+    }
+
+    #[test]
+    fn params_carry_frame_inputs() {
+        let ctx = test_ctx();
+        let mut fi = FrameInputs::reset_frame();
+        fi.jitter = [0.25, -0.125];
+        fi.pre_exposure = 2.0;
+        fi.reset = false;
+        let p = ctx.frame_params(&fi);
+        assert_eq!(p.jitter, [0.25, -0.125]);
+        assert_eq!(p.pre_exposure, 2.0);
+        assert_eq!(p.reset, 0);
+    }
+
+    #[test]
+    fn jitter_stays_in_half_pixel() {
+        for f in 1..=64u64 {
+            let j = igsr_sys::calc_jitter(f);
+            assert!(j[0] >= -0.5 && j[0] < 0.5, "f{f} x={}", j[0]);
+            assert!(j[1] >= -0.5 && j[1] < 0.5, "f{f} y={}", j[1]);
+        }
+        // Known Halton(2,3) values: f1=(0,-1/6), f2=(-1/4,+1/6).
+        let j1 = igsr_sys::calc_jitter(1);
+        assert!((j1[0] - 0.0).abs() < 1e-6 && (j1[1] + 1.0 / 6.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn reproject_identity_is_zero_motion() {
+        let ident = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let m = igsr_sys::reproject_motion([0.3, -0.5], 0.7, &ident);
+        assert!(m[0].abs() < 1e-6 && m[1].abs() < 1e-6);
+    }
+
+    #[test]
+    fn reproject_translation_matches() {
+        // prev = curr shifted by (-0.1, +0.2): motion should read (+0.1, -0.2).
+        let shift = [
+            1.0, 0.0, 0.0, -0.1, //
+            0.0, 1.0, 0.0, 0.2, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0,
+        ];
+        let m = igsr_sys::reproject_motion([0.0, 0.0], 0.5, &shift);
+        assert!((m[0] - 0.1).abs() < 1e-6, "x={}", m[0]);
+        assert!((m[1] + 0.2).abs() < 1e-6, "y={}", m[1]);
     }
 }

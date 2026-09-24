@@ -87,6 +87,32 @@ void igsr_advance_frame(IgsrContext *ctx);
 
 const char *igsr_version_string(void);
 
+/* Per-frame inputs supplied by the app (testbed scene, later Lake).
+ * clip_to_prev is row-major prevVP * invCurrVP. Motion convention is ours:
+ * NDC-unit clip-space deltas; upscale maps prev_uv = uv - 0.5 * motion. */
+typedef struct IgsrFrameInputs {
+    float jitter[2];
+    float clip_to_prev[16];
+    float pre_exposure;
+    float camera_fov_hor;
+    float camera_near;
+    float min_lerp_contrib;
+    uint32_t same_camera_frames;
+    uint32_t reset;
+} IgsrFrameInputs;
+
+/* Packs render/display sizes + rcps + frame inputs into the uniform block
+ * consumed by our shaders. Pure function of (ctx, in). */
+void igsr_fill_params(const IgsrContext *ctx, const IgsrFrameInputs *in,
+                      IgsrParams *out);
+
+/* CPU reference for depth-reprojection motion (mirrors convert shaders).
+ * clip_xy = current NDC xy, depth = dilated depth, m = clip_to_prev
+ * row-major. out_motion receives NDC-unit motion. Used by tests and by
+ * backends that must synthesize motion without a velocity texture. */
+void igsr_reproject_motion(const float clip_xy[2], float depth,
+                           const float m[16], float out_motion[2]);
+
 #ifdef __cplusplus
 }
 #endif

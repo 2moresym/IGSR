@@ -1,0 +1,68 @@
+// IGSR compute prelude: this file carries NO `#version` line. The backend
+// prepends one at runtime (see backend::gl::compute_prelude): `#version 430`
+// on GL 4.3+, `#version 420` + GL_ARB_compute_shader directive on GL 4.2
+// class hardware (HD 4000 / crocus — verified by the stage-3 selftest).
+//
+// IGSR convert pass — compute variant. Own implementation, same algorithm
+// as convert.frag (dilated depth, disocclusion factor, motion derivation);
+// only the dispatch differs (8x8 work groups + imageStore instead of a
+// fullscreen draw + fragment output). See docs/ALGORITHM_NOTES.md §2.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uniform sampler2D u_depth;    // R32F depth
+uniform sampler2D u_velocity; // RG float velocity, (0,0)=static
+layout(binding = 0, rgba16f) uniform writeonly image2D o_data;
+
+uniform vec2 u_render_size;
+uniform vec2 u_render_rcp;
+uniform mat4 u_clip_to_prev;
+uniform float u_fov_hor;
+
+const float K_SEP = 1.4e-05;
+const float EPS = 1.19e-07;
+
+float quad_min(vec4 g) {
+    return min(min(g.x, g.y), min(g.z, g.w));
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(u_render_size.x) || px.y >= int(u_render_size.y)) {
+        return;
+    }
+    vec2 center = (vec2(px) + vec2(0.5)) * u_render_rcp;
+
+    vec4 g00 = textureGather(u_depth, center + vec2(-u_render_rcp.x, -u_render_rcp.y));
+    vec4 g10 = textureGather(u_depth, center + vec2(+u_render_rcp.x, -u_render_rcp.y));
+    vec4 g01 = textureGather(u_depth, center + vec2(-u_render_rcp.x, +u_render_rcp.y));
+    vec4 g11 = textureGather(u_depth, center + vec2(+u_render_rcp.x, +u_render_rcp.y));
+    float q0 = quad_min(g00);
+    float q1 = quad_min(g10);
+    float q2 = quad_min(g01);
+    float q3 = quad_min(g11);
+    float nearest = min(min(q0, q1), min(q2, q3));
+
+    float disocc = 0.0;
+    if (nearest < 1.0 - 1.0e-05) {
+        float gap = K_SEP * u_fov_hor * length(u_render_size) * (1.0 - nearest);
+        float w = 0.0;
+        w += clamp(gap / (abs(nearest - q0) + EPS), 0.0, 1.0);
+        w += clamp(gap / (abs(nearest - q1) + EPS), 0.0, 1.0);
+        w += clamp(gap / (abs(nearest - q2) + EPS), 0.0, 1.0);
+        w += clamp(gap / (abs(nearest - q3) + EPS), 0.0, 1.0);
+        disocc = clamp(1.0 - w * 0.25, 0.0, 1.0);
+    }
+
+    vec2 vel = texelFetch(u_velocity, px, 0).xy;
+    vec2 motion;
+    if (vel.x != 0.0 || vel.y != 0.0) {
+        motion = vel;
+    } else {
+        vec2 screen = (vec2(px) + vec2(0.5)) * u_render_rcp * 2.0 - 1.0;
+        vec4 prev = u_clip_to_prev * vec4(screen, nearest, 1.0);
+        motion = screen - prev.xy / prev.w;
+    }
+
+    imageStore(o_data, px, vec4(motion, disocc, nearest));
+}

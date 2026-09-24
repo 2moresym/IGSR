@@ -5,6 +5,8 @@
 //! Vireo/Lake, no external assets. Later stages add: low-res scene render,
 //! motion vectors, jittered camera, IGSR passes, UI/debug views.
 
+mod selftest;
+
 use glow::HasContext as _;
 use glutin::config::ConfigTemplateBuilder;
 use glutin::context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext, Version};
@@ -25,11 +27,15 @@ use igsr::backend::GpuBackend;
 
 struct App {
     force_fallback: bool,
+    selftest: bool,
+    selftest_done: bool,
     window: Option<Window>,
     config: Option<glutin::config::Config>,
     surface: Option<glutin::surface::Surface<WindowSurface>>,
     context: Option<PossiblyCurrentContext>,
     gl: Option<glow::Context>,
+    gl_version: (u32, u32),
+    compute_advertised: bool,
     program: Option<glow::NativeProgram>,
     vao: Option<glow::NativeVertexArray>,
     _vbo: Option<glow::NativeBuffer>,
@@ -38,14 +44,18 @@ struct App {
 }
 
 impl App {
-    fn new(force_fallback: bool) -> Self {
+    fn new(force_fallback: bool, selftest: bool) -> Self {
         Self {
             force_fallback,
+            selftest,
+            selftest_done: false,
             window: None,
             config: None,
             surface: None,
             context: None,
             gl: None,
+            gl_version: (0, 0),
+            compute_advertised: false,
             program: None,
             vao: None,
             _vbo: None,
@@ -82,17 +92,28 @@ impl App {
             .expect("no window handle")
             .as_raw();
 
-        let context_attrs =
-            ContextAttributesBuilder::new().with_context_api(ContextApi::OpenGl(Some(
-                Version::new(3, 3),
-            )));
-        // SAFETY: raw handle is live for the life of the window.
-        let not_current = unsafe {
-            config
-                .display()
-                .create_context(&config, &context_attrs.build(Some(raw_handle)))
-                .expect("create GL context failed")
-        };
+        // IGSR passes need GLSL 4.20 (textureGather), so prefer a 4.2 core
+        // context and only fall back to 3.3 (triangle-only, no upscaler) if
+        // the driver refuses. HD 4000 / crocus does 4.2.
+        let mut not_current = None;
+        for (maj, min) in [(4u8, 2u8), (3, 3)] {
+            let try_attrs = ContextAttributesBuilder::new().with_context_api(
+                ContextApi::OpenGl(Some(Version::new(maj, min))),
+            );
+            // SAFETY: raw handle is live for the life of the window.
+            match unsafe {
+                config
+                    .display()
+                    .create_context(&config, &try_attrs.build(Some(raw_handle)))
+            } {
+                Ok(ctx) => {
+                    not_current = Some(ctx);
+                    break;
+                }
+                Err(e) => eprintln!("[testbed] GL {maj}.{min} context failed: {e:?}"),
+            }
+        }
+        let not_current = not_current.expect("no GL context (tried 4.2, 3.3)");
         let surface_attrs = window
             .build_surface_attributes(SurfaceAttributesBuilder::new())
             .expect("build surface attrs failed");
@@ -133,6 +154,8 @@ impl App {
         let extensions = ext_list.join(" ");
         let n_ext = extensions.split_whitespace().count();
         let compute = detect_compute(&version, &extensions);
+        self.gl_version = igsr::backend::gl::gl_version(&version);
+        self.compute_advertised = compute;
         let backend = if self.force_fallback {
             GlBackend::new(compute).with_forced_fallback()
         } else {
@@ -224,6 +247,25 @@ impl ApplicationHandler for App {
         if self.window.is_none() {
             self.init_gl(event_loop);
         }
+        if self.selftest && !self.selftest_done {
+            self.selftest_done = true;
+            match self.run_selftest() {
+                Ok(report) => {
+                    for line in report {
+                        eprintln!("[selftest] {line}");
+                    }
+                    eprintln!("[selftest] RESULT: PASS");
+                }
+                Err(report) => {
+                    for line in report {
+                        eprintln!("[selftest] {line}");
+                    }
+                    eprintln!("[selftest] RESULT: FAIL");
+                    std::process::exit(1);
+                }
+            }
+            event_loop.exit();
+        }
     }
 
     fn window_event(
@@ -290,7 +332,10 @@ unsafe fn compile_program(
 }
 
 fn main() {
-    let force_fallback = std::env::args().any(|a| a == "--force-fallback" || a == "-f");
+    let args: Vec<String> = std::env::args().collect();
+    let has = |s: &str| args.iter().any(|a| a == s);
+    let force_fallback = has("--force-fallback") || has("-f");
+    let selftest = has("--selftest");
 
     // ---- IGSR plumbing proof (no GPU needed) ----
     let cfg = igsr::IgsrConfig::from_display(1280, 720, igsr::QualityMode::Balanced);
@@ -316,6 +361,6 @@ fn main() {
     // ---- Open window ----
     let event_loop = EventLoop::new().expect("winit EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(force_fallback);
+    let mut app = App::new(force_fallback, selftest);
     event_loop.run_app(&mut app).expect("run_app");
 }

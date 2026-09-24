@@ -35,6 +35,19 @@ pub struct IgsrParamsFfi {
 
 pub enum IgsrContextOpaque {}
 
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct IgsrFrameInputsFfi {
+    pub jitter: [f32; 2],
+    pub clip_to_prev: [f32; 16],
+    pub pre_exposure: f32,
+    pub camera_fov_hor: f32,
+    pub camera_near: f32,
+    pub min_lerp_contrib: f32,
+    pub same_camera_frames: u32,
+    pub reset: u32,
+}
+
 // Explicit static link: the archive is built by the `igsr-core` crate's
 // build script (cc), whose `-L native=...` search path Cargo already
 // propagates to final links. The attribute records the native dep in this
@@ -65,6 +78,17 @@ extern "C" {
     pub fn igsr_frame_index(ctx: *const IgsrContextOpaque) -> u64;
     pub fn igsr_advance_frame(ctx: *mut IgsrContextOpaque);
     pub fn igsr_version_string() -> *const c_char;
+    pub fn igsr_fill_params(
+        ctx: *const IgsrContextOpaque,
+        inputs: *const IgsrFrameInputsFfi,
+        out: *mut IgsrParamsFfi,
+    );
+    pub fn igsr_reproject_motion(
+        clip_xy: *const f32,
+        depth: f32,
+        m: *const f32,
+        out_motion: *mut f32,
+    );
 }
 
 /// Safe helper: run Halton jitter for a frame without a context.
@@ -72,5 +96,20 @@ pub fn calc_jitter(frame_index: u64) -> [f32; 2] {
     let mut out = [0.0f32; 2];
     // SAFETY: out is a valid 2-float buffer; C writes exactly 2 floats.
     unsafe { igsr_calc_jitter(frame_index, out.as_mut_ptr()) };
+    out
+}
+
+/// Safe helper: CPU depth-reprojection motion (mirrors the convert shaders).
+pub fn reproject_motion(clip_xy: [f32; 2], depth: f32, m: &[f32; 16]) -> [f32; 2] {
+    let mut out = [0.0f32; 2];
+    // SAFETY: all pointers are to valid stack arrays of the right size.
+    unsafe {
+        igsr_reproject_motion(
+            clip_xy.as_ptr(),
+            depth,
+            m.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
     out
 }

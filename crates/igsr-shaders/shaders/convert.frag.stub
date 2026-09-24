@@ -1,3 +1,0 @@
-#version 330 core
-// STUB — fragment convert fallback lands in stage 4.
-void main() {}

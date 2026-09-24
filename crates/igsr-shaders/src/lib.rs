@@ -8,11 +8,10 @@
 pub const TRIANGLE_VERT: &str = include_str!("../shaders/triangle.vert");
 pub const TRIANGLE_FRAG: &str = include_str!("../shaders/triangle.frag");
 
-// Stage 3–4 placeholders so the module layout is stable from day one.
-// Each returns the stub source checked into shaders/ (a `#error`-style
-// comment until the real reimplementation lands).
-pub const CONVERT_COMP_STUB: &str = include_str!("../shaders/convert.comp.stub");
+pub const CONVERT_FRAG: &str = include_str!("../shaders/convert.frag");
+pub const CONVERT_COMP: &str = include_str!("../shaders/convert.comp");
+
+// Stage 4 placeholders: reimplemented upscale (own code) lands next.
 pub const UPSCALE_COMP_STUB: &str = include_str!("../shaders/upscale.comp.stub");
-pub const CONVERT_FRAG_STUB: &str = include_str!("../shaders/convert.frag.stub");
 pub const UPSCALE_FRAG_STUB: &str = include_str!("../shaders/upscale.frag.stub");
 pub const FULLSCREEN_VERT: &str = include_str!("../shaders/fullscreen.vert");

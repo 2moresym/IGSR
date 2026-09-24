@@ -68,3 +68,53 @@ impl IgsrConfig {
         }
     }
 }
+
+/// Per-frame inputs for uniform packing. Built by the app each frame from
+/// its camera (jittered projection), exposure, and cut/camera state.
+#[derive(Debug, Clone)]
+pub struct FrameInputs {
+    pub jitter: [f32; 2],
+    /// Row-major prevVP * invCurrVP.
+    pub clip_to_prev: [f32; 16],
+    pub pre_exposure: f32,
+    pub camera_fov_hor: f32,
+    pub camera_near: f32,
+    pub min_lerp: f32,
+    pub same_camera_frames: u32,
+    pub reset: bool,
+}
+
+impl FrameInputs {
+    /// Neutral defaults: no jitter, identity reprojection, reset on.
+    /// Real frames overwrite jitter/clip_to_prev from the camera.
+    pub fn reset_frame() -> Self {
+        Self {
+            jitter: [0.0, 0.0],
+            clip_to_prev: [
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            pre_exposure: 1.0,
+            camera_fov_hor: 1.0,
+            camera_near: 0.1,
+            min_lerp: 0.2,
+            same_camera_frames: 0,
+            reset: true,
+        }
+    }
+
+    pub(crate) fn to_ffi(&self) -> igsr_sys::IgsrFrameInputsFfi {
+        igsr_sys::IgsrFrameInputsFfi {
+            jitter: self.jitter,
+            clip_to_prev: self.clip_to_prev,
+            pre_exposure: self.pre_exposure,
+            camera_fov_hor: self.camera_fov_hor,
+            camera_near: self.camera_near,
+            min_lerp_contrib: self.min_lerp,
+            same_camera_frames: self.same_camera_frames,
+            reset: self.reset as u32,
+        }
+    }
+}
