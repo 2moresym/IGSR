@@ -97,6 +97,30 @@ cargo test --workspace
 intel_gpu_top   # in another terminal while the testbed runs
 ```
 
+## 7. Keybind testing (stage 8B verdict: closed, not tool-fixable here)
+
+Live keypresses cannot be automated on this box, verified twice:
+
+- `wtype` (Wayland virtual-keyboard): input never reaches the testbed
+  window under niri (confirmed with `--debug-events` — zero
+  `KeyboardInput` arrives; a stray Escape in one log was human).
+- `ydotool` (uinput, below the compositor): not installed, and both the
+  install and `/dev/uinput` access (node is `root:root 600`) need a
+  passworded sudo that isn't available to the agent. If a human runs
+  `sudo apt-get install -y ydotool && sudo chmod 666 /dev/uinput` plus a
+  background `ydotoold`, the `niri msg action focus-window --id …` +
+  `ydotool key …` recipe from stage 6 is ready to retry — but until then,
+  this is settled, not open.
+
+Permanent coverage instead (all green, all in-repo):
+
+- `cargo test -p igsr-testbed`: `handle_key` unit tests drive every
+  binding headless (view cycle, direct M/H, scale clamp 0.25–1.0,
+  R/F/T/G with and without a pipeline).
+- `--view <upscaled|native|split|motion|luma> --dump <file>`: exercises
+  every rendering branch behind the keybinds and produces diffable
+  images (this is what caught the stage-6 velocity-clear and RG16F bugs).
+
 Keys in the window: `V` cycle views, `M` motion, `H` luma-history,
 `+`/`-` live scale, `R` history reset (camera-cut path), `F`
 compute/fragment toggle, `T` 2/3-pass toggle, `G` gpu-times overlay.
