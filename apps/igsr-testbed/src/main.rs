@@ -1,10 +1,14 @@
-//! igsr-testbed — standalone test window (stage 1).
+//! igsr-testbed — standalone test window (stage 5).
 //!
-//! Stage 1 scope: open one window, render an animated color triangle with
-//! plain OpenGL, and print the IGSR core/backend plumbing info. No game, no
-//! Vireo/Lake, no external assets. Later stages add: low-res scene render,
-//! motion vectors, jittered camera, IGSR passes, UI/debug views.
+//! Procedural animated 3D scene (spinning cube + moon + floor) rendered at
+//! a lower internal resolution with a Halton-jittered camera, fed through
+//! the live IGSR chain (convert → [activate] → upscale, fragment or compute
+//! per backend) with history ping-pong, and blitted to the window. No game,
+//! no Vireo/Lake, no external assets.
 
+mod mat4;
+mod pipeline;
+mod scene;
 mod selftest;
 
 use glow::HasContext as _;
@@ -27,6 +31,7 @@ use igsr::backend::GpuBackend;
 
 struct App {
     force_fallback: bool,
+    three_pass: bool,
     selftest: bool,
     selftest_done: bool,
     window: Option<Window>,
@@ -36,17 +41,26 @@ struct App {
     gl: Option<glow::Context>,
     gl_version: (u32, u32),
     compute_advertised: bool,
-    program: Option<glow::NativeProgram>,
-    vao: Option<glow::NativeVertexArray>,
-    _vbo: Option<glow::NativeBuffer>,
+    backend_compute: bool,
+    // Live pipeline state (stage 5).
+    ctx: Option<igsr::IgsrContext>,
+    scene: Option<scene::Scene>,
+    pipeline: Option<pipeline::Pipeline>,
+    dump_path: Option<String>,
+    scale: f32,
+    angle: f32,
+    last_frame: std::time::Instant,
+    same_camera: u32,
     start: std::time::Instant,
     frames: u64,
 }
 
 impl App {
-    fn new(force_fallback: bool, selftest: bool) -> Self {
+    fn new(force_fallback: bool, three_pass: bool, selftest: bool, dump_path: Option<String>) -> Self {
+        let now = std::time::Instant::now();
         Self {
             force_fallback,
+            three_pass,
             selftest,
             selftest_done: false,
             window: None,
@@ -56,10 +70,16 @@ impl App {
             gl: None,
             gl_version: (0, 0),
             compute_advertised: false,
-            program: None,
-            vao: None,
-            _vbo: None,
-            start: std::time::Instant::now(),
+            backend_compute: false,
+            ctx: None,
+            scene: None,
+            pipeline: None,
+            dump_path,
+            scale: 0.5,
+            angle: 0.0,
+            last_frame: now,
+            same_camera: 0,
+            start: now,
             frames: 0,
         }
     }
@@ -170,42 +190,51 @@ impl App {
             if self.force_fallback { " (forced fallback)" } else { "" }
         );
 
-        // Compile the debug triangle (own shaders, not reference code).
-        let program = unsafe { compile_program(&gl, igsr_shaders::TRIANGLE_VERT, igsr_shaders::TRIANGLE_FRAG) };
-
-        // Interleaved triangle: x, y, r, g, b.
-        #[rustfmt::skip]
-        let verts: [f32; 15] = [
-             0.0,  0.6,  1.0, 0.2, 0.2,
-            -0.6, -0.5,  0.2, 1.0, 0.2,
-             0.6, -0.5,  0.2, 0.2, 1.0,
-        ];
-        let (vao, vbo) = unsafe {
-            let vao = gl.create_vertex_array().expect("vao");
-            let vbo = gl.create_buffer().expect("vbo");
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            let bytes: &[u8] = std::slice::from_raw_parts(
-                verts.as_ptr() as *const u8,
-                verts.len() * std::mem::size_of::<f32>(),
-            );
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 5 * 4, 0);
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, 5 * 4, 2 * 4);
-            gl.enable_vertex_attrib_array(1);
-            gl.bind_vertex_array(None);
-            (vao, vbo)
+        // Build the live chain: IGSR context sized to the window, pipeline
+        // FBOs, and the procedural scene. Failures here are fatal: without
+        // the chain there is nothing to display.
+        let win_size = window.inner_size();
+        let dw = win_size.width.max(320);
+        let dh = win_size.height.max(200);
+        let rw = ((dw as f32 * self.scale) as u32).max(8);
+        let rh = ((dh as f32 * self.scale) as u32).max(8);
+        let cfg = igsr::IgsrConfig::new(rw, rh, dw, dh);
+        let ictx = igsr::IgsrContext::new(cfg).expect("IgsrContext::new");
+        let (maj, min) = self.gl_version;
+        let pipe = unsafe {
+            pipeline::Pipeline::new(
+                &gl,
+                maj,
+                min,
+                backend.supports_compute(),
+                self.three_pass,
+                rw,
+                rh,
+                dw,
+                dh,
+            )
+            .expect("pipeline init")
         };
+        let scn = unsafe { scene::Scene::new(&gl).expect("scene init") };
+        eprintln!(
+            "[testbed] chain: render={}x{} display={}x{} compute={} three_pass={}",
+            rw,
+            rh,
+            dw,
+            dh,
+            pipe.use_compute,
+            self.three_pass && pipe.use_compute,
+        );
+        self.backend_compute = backend.supports_compute();
 
         self.window = Some(window);
         self.config = Some(config);
         self.surface = Some(surface);
         self.context = Some(context);
         self.gl = Some(gl);
-        self.program = Some(program);
-        self.vao = Some(vao);
-        self._vbo = Some(vbo);
+        self.ctx = Some(ictx);
+        self.scene = Some(scn);
+        self.pipeline = Some(pipe);
     }
 
     fn draw(&mut self) {
@@ -218,26 +247,105 @@ impl App {
             (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
             _ => return,
         };
-        let size = window.inner_size();
-        unsafe {
-            gl.viewport(0, 0, size.width as i32, size.height as i32);
-            // Animated clear color so a static screenshot still proves frames advance.
-            let t = self.start.elapsed().as_secs_f32();
-            let pulse = 0.5 + 0.5 * (t * 1.5).sin();
-            gl.clear_color(0.05 + 0.1 * pulse, 0.07, 0.10 + 0.15 * (1.0 - pulse), 1.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            gl.use_program(self.program);
-            gl.bind_vertex_array(self.vao);
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
-            gl.bind_vertex_array(None);
+        if self.ctx.is_none() || self.scene.is_none() || self.pipeline.is_none() {
+            return;
         }
+        let size = window.inner_size();
+        let dw = size.width.max(320);
+        let dh = size.height.max(200);
+        let rw = ((dw as f32 * self.scale) as u32).max(8);
+        let rh = ((dh as f32 * self.scale) as u32).max(8);
+
+        let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
+        self.last_frame = std::time::Instant::now();
+        self.angle += dt * 0.5;
+
+        let ctx = self.ctx.as_mut().unwrap();
+        let pipe = self.pipeline.as_mut().unwrap();
+        let scn = self.scene.as_mut().unwrap();
+
+        // Window resize → resize the chain (history reset, like a cut).
+        if pipe.render_size() != (rw, rh) {
+            unsafe { pipe.resize(gl, rw, rh, dw, dh) };
+            ctx.resize(rw, rh, dw, dh).expect("ctx resize");
+            self.same_camera = 0;
+        }
+
+        // Jittered camera: Halton offset from the C core, standard
+        // projection-matrix shift at render resolution.
+        let jitter = ctx.jitter();
+        let aspect = rw as f32 / rh as f32;
+        let fov_v = 1.0472; // 60 deg
+        let (near, far) = (0.1, 50.0);
+        let view = mat4::look_at([0.0, 1.2, 4.5], [0.0, 0.3, 0.0], [0.0, 1.0, 0.0]);
+        let mut proj = mat4::perspective(fov_v, aspect, near, far);
+        mat4::apply_jitter(&mut proj, jitter[0], jitter[1], rw as f32, rh as f32);
+
+        // Scene pass at render res (color + velocity + linear depth).
+        let (vp, vp_prev) = unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(pipe.scene_fbo()));
+            gl.viewport(0, 0, rw as i32, rh as i32);
+            gl.enable(glow::DEPTH_TEST);
+            gl.depth_func(glow::LESS);
+            gl.clear_color(0.04, 0.05, 0.08, 1.0);
+            gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            scn.render(gl, self.angle, &view, &proj, far)
+        };
+
+        // Frame uniforms: single source of truth via the C core.
+        let reset = pipe.needs_reset;
+        let clip_col = mat4::mul(&vp_prev, &mat4::inverse(&vp));
+        let inputs = igsr::FrameInputs {
+            jitter,
+            clip_to_prev: mat4::transpose(&clip_col),
+            pre_exposure: 1.0,
+            camera_fov_hor: (fov_v * 0.5).tan() * aspect,
+            camera_near: near,
+            min_lerp: 0.2,
+            same_camera_frames: self.same_camera,
+            reset,
+        };
+        let params = ctx.frame_params(&inputs);
+        let out_tex = unsafe { pipe.execute(gl, &params) };
+        unsafe { pipe.blit_to_screen(gl, out_tex, size.width as i32, size.height as i32) };
+
+        ctx.advance_frame();
+        self.same_camera = if reset { 0 } else { self.same_camera + 1 };
+
+        // One-shot framebuffer dump for visual verification (stage 5+).
+        if let Some(path) = self.dump_path.clone() {
+            if self.frames == 120 {
+                unsafe {
+                    let w = size.width as i32;
+                    let h = size.height as i32;
+                    let mut px = vec![0u8; (w * h * 4) as usize];
+                    gl.read_pixels(
+                        0, 0, w, h,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut px)),
+                    );
+                    // PPM (P6), flipped to top-down row order.
+                    let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                    for y in (0..h).rev() {
+                        for x in 0..w {
+                            let i = ((y * w + x) * 4) as usize;
+                            ppm.extend_from_slice(&px[i..i + 3]);
+                        }
+                    }
+                    std::fs::write(&path, &ppm).expect("dump write");
+                    eprintln!("[testbed] dumped frame {} to {path}", self.frames);
+                }
+            }
+        }
+
         if let Err(e) = surface.swap_buffers(context) {
             eprintln!("[testbed] swap_buffers err: {e:?}");
         }
         self.frames += 1;
         if self.frames % 600 == 0 {
             let fps = self.frames as f32 / self.start.elapsed().as_secs_f32();
-            eprintln!("[testbed] ~{fps:.1} fps over {} frames", self.frames);
+            eprintln!("[testbed] ~{fps:.1} fps over {} frames ({}x{} -> {}x{})", self.frames, rw, rh, dw, dh);
         }
     }
 }
@@ -300,42 +408,16 @@ impl ApplicationHandler for App {
     }
 }
 
-unsafe fn compile_program(
-    gl: &glow::Context,
-    vs_src: &str,
-    fs_src: &str,
-) -> glow::NativeProgram {
-    unsafe {
-        let vs = gl.create_shader(glow::VERTEX_SHADER).expect("vs");
-        gl.shader_source(vs, vs_src);
-        gl.compile_shader(vs);
-        if !gl.get_shader_compile_status(vs) {
-            panic!("vertex compile failed: {}", gl.get_shader_info_log(vs));
-        }
-        let fs = gl.create_shader(glow::FRAGMENT_SHADER).expect("fs");
-        gl.shader_source(fs, fs_src);
-        gl.compile_shader(fs);
-        if !gl.get_shader_compile_status(fs) {
-            panic!("fragment compile failed: {}", gl.get_shader_info_log(fs));
-        }
-        let prog = gl.create_program().expect("program");
-        gl.attach_shader(prog, vs);
-        gl.attach_shader(prog, fs);
-        gl.link_program(prog);
-        if !gl.get_program_link_status(prog) {
-            panic!("link failed: {}", gl.get_program_info_log(prog));
-        }
-        gl.delete_shader(vs);
-        gl.delete_shader(fs);
-        prog
-    }
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let has = |s: &str| args.iter().any(|a| a == s);
     let force_fallback = has("--force-fallback") || has("-f");
+    let three_pass = has("--three-pass");
     let selftest = has("--selftest");
+    let dump_path = args
+        .iter()
+        .position(|a| a == "--dump")
+        .and_then(|i| args.get(i + 1).cloned());
 
     // ---- IGSR plumbing proof (no GPU needed) ----
     let cfg = igsr::IgsrConfig::from_display(1280, 720, igsr::QualityMode::Balanced);
@@ -361,6 +443,6 @@ fn main() {
     // ---- Open window ----
     let event_loop = EventLoop::new().expect("winit EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(force_fallback, selftest);
+    let mut app = App::new(force_fallback, three_pass, selftest, dump_path);
     event_loop.run_app(&mut app).expect("run_app");
 }
