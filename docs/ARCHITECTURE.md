@@ -29,10 +29,10 @@ the fragment path for testing. Keep allocations conservative (4 GB RAM).
 
 ## Build order
 
-1. ✅ Workspace + triangle (this stage).
-2. `docs/ALGORITHM_NOTES.md` from the real shaders.
-3. Pass 1 (convert) reimplemented + wired.
-4. Pass 2 (CS + FS) + upscale/output.
-5. Jitter + history ping-pong + camera jitter.
-6. UI controls + debug views.
-7. HD 4000 profiling note.
+1. ✅ Workspace + triangle (stage 1; triangle since replaced by the live scene).
+2. ✅ `docs/ALGORITHM_NOTES.md` from the real shaders (stage 2).
+3. ✅ Pass 1 (convert) reimplemented + wired (stage 3).
+4. ✅ Pass 2 (CS + FS) + upscale/output + activate (stage 4).
+5. ✅ Jitter + history ping-pong + camera jitter (stage 5).
+6. ✅ UI controls + debug views — keybinds, no egui (stage 6).
+7. ✅ HD 4000 profiling note (stage 7: `docs/PROFILING_HD4000.md`).
