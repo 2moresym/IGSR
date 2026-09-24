@@ -18,6 +18,35 @@ void main() {
 }
 ";
 
+// Debug view: convert motion/disocclusion buffer. Motion is shown in
+// render-resolution pixels per frame (±4px maps red/green around
+// mid-grey); disocclusion goes to blue. Static + attached pixels read
+// (0.5,0.5,0).
+const MOTION_FRAG: &str = "#version 420 core
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_col;
+uniform sampler2D u_tex;
+uniform vec2 u_render_size;
+void main() {
+    vec4 d = texture(u_tex, v_uv);
+    vec2 px = d.xy * u_render_size * 0.25;
+    o_col = vec4(clamp(px * 0.5 + 0.5, 0.0, 1.0), d.z, 1.0);
+}
+";
+
+// Debug view: luma history (R = luma grey, G = signed delta as red/blue).
+// All black in 2-pass mode (no luma tracking) — that itself is the signal.
+const LUMA_FRAG: &str = "#version 420 core
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_col;
+uniform sampler2D u_tex;
+void main() {
+    vec2 l = texture(u_tex, v_uv).rg;
+    float d = clamp(l.y * 8.0, -0.5, 0.5);
+    o_col = vec4(l.x + d, l.x - abs(d) * 0.5, l.x - d, 1.0);
+}
+";
+
 fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
@@ -70,12 +99,16 @@ pub struct Pipeline {
     hist_fbo: [glow::NativeFramebuffer; 2],
     hist_tex: [glow::NativeTexture; 2],
     hist_read: usize,
+    // Convert/activate output consumed by the last upscale (debug views).
+    last_data: Option<glow::NativeTexture>,
     // Compute-path scene copy (display res; also feeds stage-6 debug views).
     scene_out_tex: glow::NativeTexture,
     // Programs.
     convert_frag: glow::NativeProgram,
     upscale_frag: glow::NativeProgram,
     blit_prog: glow::NativeProgram,
+    motion_prog: glow::NativeProgram,
+    luma_prog: glow::NativeProgram,
     convert_comp: Option<glow::NativeProgram>,
     upscale_comp: Option<glow::NativeProgram>,
     activate_comp: Option<glow::NativeProgram>,
@@ -102,6 +135,10 @@ impl Pipeline {
                 gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, igsr_shaders::UPSCALE_FRAG)?;
             let blit_prog =
                 gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, BLIT_FRAG)?;
+            let motion_prog =
+                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, MOTION_FRAG)?;
+            let luma_prog =
+                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, LUMA_FRAG)?;
 
             // Compute programs (prelude + body). Any failure → fragment path.
             let prelude = gl_backend::compute_prelude(gl_major, gl_minor, backend_compute);
@@ -161,10 +198,13 @@ impl Pipeline {
                 hist_fbo: [gl.create_framebuffer().unwrap(), gl.create_framebuffer().unwrap()],
                 hist_tex: [gl.create_texture().unwrap(), gl.create_texture().unwrap()],
                 hist_read: 0,
+                last_data: None,
                 scene_out_tex: gl.create_texture().unwrap(),
                 convert_frag,
                 upscale_frag,
                 blit_prog,
+                motion_prog,
+                luma_prog,
                 convert_comp,
                 upscale_comp,
                 activate_comp,
@@ -242,6 +282,7 @@ impl Pipeline {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.luma_read = 0;
             self.hist_read = 0;
+            self.last_data = None;
             self.scene_out_tex =
                 tex2d(gl, glow::RGBA16F as i32, dw, dh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::NEAREST);
             self.needs_reset = true;
@@ -400,7 +441,7 @@ impl Pipeline {
                 }
                 let lw = 1 - self.luma_read;
                 gl.bind_image_texture(0, Some(self.data2_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
-                gl.bind_image_texture(1, Some(self.luma_tex[lw]), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
+                gl.bind_image_texture(1, Some(self.luma_tex[lw]), 0, false, 0, glow::WRITE_ONLY, glow::RG16F);
                 gl.dispatch_compute(gx, gy, 1);
                 Self::barrier(gl);
                 gl.use_program(None);
@@ -447,6 +488,7 @@ impl Pipeline {
             }
             self.hist_read = hw;
             self.needs_reset = false;
+            self.last_data = Some(data_for_upscale);
             self.hist_tex[self.hist_read]
         }
     }
@@ -460,16 +502,63 @@ impl Pipeline {
         win_h: i32,
     ) {
         unsafe {
+            self.blit_region(gl, tex, self.blit_prog, 0, 0, win_w, win_h);
+        }
+    }
+
+    /// Viewport-clipped blit with an explicit program (split-screen views).
+    pub unsafe fn blit_region(
+        &self,
+        gl: &glow::Context,
+        tex: glow::NativeTexture,
+        prog: glow::NativeProgram,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) {
+        unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.viewport(0, 0, win_w, win_h);
+            gl.viewport(x, y, w, h);
             gl.disable(glow::DEPTH_TEST);
-            gl.use_program(Some(self.blit_prog));
+            gl.use_program(Some(prog));
             Self::bind_tex(gl, 0, tex);
-            if let Some(l) = Self::uni(gl, self.blit_prog, "u_tex") {
+            if let Some(l) = Self::uni(gl, prog, "u_tex") {
                 gl.uniform_1_i32(Some(&l), 0);
+            }
+            // Only the motion debug program declares this; others skip it.
+            if let Some(l) = Self::uni(gl, prog, "u_render_size") {
+                gl.uniform_2_f32(Some(&l), self.rw as f32, self.rh as f32);
             }
             Self::draw_full(gl, self.blit_vao);
             gl.use_program(None);
         }
+    }
+
+    // ---- Stage-6 debug-view accessors ----
+    pub fn blit_prog(&self) -> glow::NativeProgram {
+        self.blit_prog
+    }
+    pub fn motion_prog(&self) -> glow::NativeProgram {
+        self.motion_prog
+    }
+    pub fn luma_prog(&self) -> glow::NativeProgram {
+        self.luma_prog
+    }
+    pub fn scene_color_tex(&self) -> glow::NativeTexture {
+        self.scene_color
+    }
+    pub fn data_tex_debug(&self) -> Option<glow::NativeTexture> {
+        self.last_data
+    }
+    pub fn luma_tex_debug(&self) -> glow::NativeTexture {
+        self.luma_tex[self.luma_read]
+    }
+    pub fn display_size(&self) -> (u32, u32) {
+        (self.dw, self.dh)
+    }
+    /// Compute dispatch is usable only if both compute programs compiled.
+    pub fn can_compute(&self) -> bool {
+        self.convert_comp.is_some() && self.upscale_comp.is_some()
     }
 }

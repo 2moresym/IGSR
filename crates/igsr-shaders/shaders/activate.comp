@@ -25,7 +25,7 @@ uniform sampler2D u_data;
 uniform sampler2D u_color;
 uniform sampler2D u_luma_prev;
 layout(binding = 0, rgba16f) uniform writeonly image2D o_data;
-layout(binding = 1, rgba16f) uniform writeonly image2D o_luma;
+layout(binding = 1, rg16f) uniform writeonly image2D o_luma;
 
 uniform vec2 u_render_size;
 uniform vec2 u_render_rcp;

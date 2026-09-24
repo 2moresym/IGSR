@@ -22,12 +22,44 @@ use std::ffi::CString;
 use std::num::NonZeroU32;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::Window;
 
 use igsr::backend::gl::{detect_compute, GlBackend};
 use igsr::backend::GpuBackend;
+
+/// Stage-6 view modes (key V cycles; M/H jump directly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Upscaled,
+    Native,
+    Split,
+    Motion,
+    Luma,
+}
+
+impl ViewMode {
+    fn next(self) -> ViewMode {
+        match self {
+            ViewMode::Upscaled => ViewMode::Native,
+            ViewMode::Native => ViewMode::Split,
+            ViewMode::Split => ViewMode::Motion,
+            ViewMode::Motion => ViewMode::Luma,
+            ViewMode::Luma => ViewMode::Upscaled,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            ViewMode::Upscaled => "upscaled",
+            ViewMode::Native => "native scene",
+            ViewMode::Split => "split native|upscaled",
+            ViewMode::Motion => "motion/disocc debug",
+            ViewMode::Luma => "luma-history debug",
+        }
+    }
+}
 
 struct App {
     force_fallback: bool,
@@ -47,6 +79,8 @@ struct App {
     scene: Option<scene::Scene>,
     pipeline: Option<pipeline::Pipeline>,
     dump_path: Option<String>,
+    view: ViewMode,
+    debug_events: bool,
     scale: f32,
     angle: f32,
     last_frame: std::time::Instant,
@@ -56,8 +90,13 @@ struct App {
 }
 
 impl App {
-    fn new(force_fallback: bool, three_pass: bool, selftest: bool, dump_path: Option<String>) -> Self {
-        let now = std::time::Instant::now();
+    fn new(
+        force_fallback: bool,
+        three_pass: bool,
+        selftest: bool,
+        dump_path: Option<String>,
+        debug_events: bool,
+    ) -> Self {        let now = std::time::Instant::now();
         Self {
             force_fallback,
             three_pass,
@@ -75,6 +114,8 @@ impl App {
             scene: None,
             pipeline: None,
             dump_path,
+            view: ViewMode::Upscaled,
+            debug_events,
             scale: 0.5,
             angle: 0.0,
             last_frame: now,
@@ -85,7 +126,7 @@ impl App {
     }
 
     fn init_gl(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes().with_title("IGSR testbed (stage 1: triangle)");
+        let attrs = Window::default_attributes().with_title("IGSR testbed");
         let template = ConfigTemplateBuilder::new().with_api(glutin::config::Api::OPENGL);
 
         let (window, config) = DisplayBuilder::new()
@@ -225,6 +266,7 @@ impl App {
             pipe.use_compute,
             self.three_pass && pipe.use_compute,
         );
+        eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | +/- scale | R reset | F compute/frag | T 2/3-pass");
         self.backend_compute = backend.supports_compute();
 
         self.window = Some(window);
@@ -289,6 +331,11 @@ impl App {
             gl.depth_func(glow::LESS);
             gl.clear_color(0.04, 0.05, 0.08, 1.0);
             gl.clear(glow::COLOR_BUFFER_BIT | glow::DEPTH_BUFFER_BIT);
+            // MRT attachments need their own clears: velocity must be exact
+            // zero (static) and linear depth must start at far (1.0). The
+            // gl.clear above only sets attachment 0 correctly.
+            gl.clear_buffer_f32_slice(glow::COLOR, 1, &[0.0, 0.0, 0.0, 0.0]);
+            gl.clear_buffer_f32_slice(glow::COLOR, 2, &[1.0, 0.0, 0.0, 0.0]);
             scn.render(gl, self.angle, &view, &proj, far)
         };
 
@@ -307,7 +354,31 @@ impl App {
         };
         let params = ctx.frame_params(&inputs);
         let out_tex = unsafe { pipe.execute(gl, &params) };
-        unsafe { pipe.blit_to_screen(gl, out_tex, size.width as i32, size.height as i32) };
+        // Stage-6 views.
+        let ww = size.width as i32;
+        let wh = size.height as i32;
+        unsafe {
+            match self.view {
+                ViewMode::Upscaled => pipe.blit_to_screen(gl, out_tex, ww, wh),
+                ViewMode::Native => {
+                    pipe.blit_to_screen(gl, pipe.scene_color_tex(), ww, wh)
+                }
+                ViewMode::Split => {
+                    pipe.blit_region(gl, pipe.scene_color_tex(), pipe.blit_prog(), 0, 0, ww / 2, wh);
+                    pipe.blit_region(gl, out_tex, pipe.blit_prog(), ww / 2, 0, ww - ww / 2, wh);
+                }
+                ViewMode::Motion => {
+                    if let Some(d) = pipe.data_tex_debug() {
+                        pipe.blit_region(gl, d, pipe.motion_prog(), 0, 0, ww, wh);
+                    } else {
+                        pipe.blit_to_screen(gl, out_tex, ww, wh);
+                    }
+                }
+                ViewMode::Luma => {
+                    pipe.blit_region(gl, pipe.luma_tex_debug(), pipe.luma_prog(), 0, 0, ww, wh);
+                }
+            }
+        }
 
         ctx.advance_frame();
         self.same_camera = if reset { 0 } else { self.same_camera + 1 };
@@ -348,6 +419,90 @@ impl App {
             eprintln!("[testbed] ~{fps:.1} fps over {} frames ({}x{} -> {}x{})", self.frames, rw, rh, dw, dh);
         }
     }
+
+    fn print_status(&self) {
+        let (rw, rh) = self.pipeline.as_ref().map(|p| p.render_size()).unwrap_or((0, 0));
+        let (dw, dh) = self.pipeline.as_ref().map(|p| p.display_size()).unwrap_or((0, 0));
+        let path = self
+            .pipeline
+            .as_ref()
+            .map(|p| if p.use_compute { "compute" } else { "fragment" })
+            .unwrap_or("?");
+        let passes = if self.pipeline.as_ref().map(|p| p.three_pass && p.use_compute).unwrap_or(false) {
+            3
+        } else {
+            2
+        };
+        eprintln!(
+            "[testbed] view={} scale={:.2} ({}x{}->{}x{}) path={} passes={}",
+            self.view.name(),
+            self.scale,
+            rw,
+            rh,
+            dw,
+            dh,
+            path,
+            passes
+        );
+    }
+
+    fn handle_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::KeyV => {
+                self.view = self.view.next();
+                self.print_status();
+            }
+            KeyCode::KeyM => {
+                self.view = ViewMode::Motion;
+                self.print_status();
+            }
+            KeyCode::KeyH => {
+                self.view = ViewMode::Luma;
+                self.print_status();
+            }
+            KeyCode::Equal | KeyCode::NumpadAdd => {
+                self.scale = (self.scale + 0.05).min(1.0);
+                self.print_status();
+            }
+            KeyCode::Minus | KeyCode::NumpadSubtract => {
+                self.scale = (self.scale - 0.05).max(0.25);
+                self.print_status();
+            }
+            KeyCode::KeyR => {
+                if let Some(p) = self.pipeline.as_mut() {
+                    p.needs_reset = true;
+                }
+                self.same_camera = 0;
+                eprintln!("[testbed] history reset (camera-cut path)");
+            }
+            KeyCode::KeyF => {
+                if let Some(p) = self.pipeline.as_mut() {
+                    if p.use_compute {
+                        p.use_compute = false;
+                        eprintln!("[testbed] forced fragment path");
+                    } else if p.can_compute() {
+                        p.use_compute = true;
+                        p.needs_reset = true;
+                        self.same_camera = 0;
+                        eprintln!("[testbed] compute path");
+                    } else {
+                        eprintln!("[testbed] compute programs unavailable; staying fragment");
+                    }
+                }
+                self.print_status();
+            }
+            KeyCode::KeyT => {
+                if let Some(p) = self.pipeline.as_mut() {
+                    p.three_pass = !p.three_pass;
+                    p.needs_reset = true;
+                    self.same_camera = 0;
+                    eprintln!("[testbed] three_pass={}", p.three_pass);
+                }
+                self.print_status();
+            }
+            _ => {}
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -382,6 +537,9 @@ impl ApplicationHandler for App {
         _id: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        if self.debug_events {
+            eprintln!("[events] {event:?}");
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -397,6 +555,13 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => self.draw(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        self.handle_key(code);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -414,10 +579,23 @@ fn main() {
     let force_fallback = has("--force-fallback") || has("-f");
     let three_pass = has("--three-pass");
     let selftest = has("--selftest");
+    let debug_events = has("--debug-events");
     let dump_path = args
         .iter()
         .position(|a| a == "--dump")
         .and_then(|i| args.get(i + 1).cloned());
+    let init_view = args
+        .iter()
+        .position(|a| a == "--view")
+        .and_then(|i| args.get(i + 1).cloned())
+        .and_then(|v| match v.as_str() {
+            "native" => Some(ViewMode::Native),
+            "split" => Some(ViewMode::Split),
+            "motion" => Some(ViewMode::Motion),
+            "luma" => Some(ViewMode::Luma),
+            _ => Some(ViewMode::Upscaled),
+        })
+        .unwrap_or(ViewMode::Upscaled);
 
     // ---- IGSR plumbing proof (no GPU needed) ----
     let cfg = igsr::IgsrConfig::from_display(1280, 720, igsr::QualityMode::Balanced);
@@ -443,6 +621,73 @@ fn main() {
     // ---- Open window ----
     let event_loop = EventLoop::new().expect("winit EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(force_fallback, three_pass, selftest, dump_path);
+    let mut app = App::new(force_fallback, three_pass, selftest, dump_path, debug_events);
+    app.view = init_view;
     event_loop.run_app(&mut app).expect("run_app");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headless_app() -> App {
+        App::new(false, false, false, None, false)
+    }
+
+    #[test]
+    fn view_cycles_all_modes() {
+        let mut a = headless_app();
+        let mut seen = vec![a.view];
+        for _ in 0..4 {
+            a.handle_key(KeyCode::KeyV);
+            seen.push(a.view);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                ViewMode::Upscaled,
+                ViewMode::Native,
+                ViewMode::Split,
+                ViewMode::Motion,
+                ViewMode::Luma,
+            ]
+        );
+        a.handle_key(KeyCode::KeyV);
+        assert_eq!(a.view, ViewMode::Upscaled);
+    }
+
+    #[test]
+    fn direct_view_keys() {
+        let mut a = headless_app();
+        a.handle_key(KeyCode::KeyM);
+        assert_eq!(a.view, ViewMode::Motion);
+        a.handle_key(KeyCode::KeyH);
+        assert_eq!(a.view, ViewMode::Luma);
+    }
+
+    #[test]
+    fn scale_clamps() {
+        let mut a = headless_app();
+        for _ in 0..20 {
+            a.handle_key(KeyCode::Equal);
+        }
+        assert!((a.scale - 1.0).abs() < 1e-6);
+        for _ in 0..30 {
+            a.handle_key(KeyCode::Minus);
+        }
+        assert!((a.scale - 0.25).abs() < 1e-6);
+        a.handle_key(KeyCode::Equal);
+        assert!(a.scale > 0.25);
+    }
+
+    #[test]
+    fn toggles_safe_without_pipeline() {
+        // No GL context here: every arm must degrade gracefully.
+        let mut a = headless_app();
+        a.handle_key(KeyCode::KeyR);
+        a.handle_key(KeyCode::KeyF);
+        a.handle_key(KeyCode::KeyT);
+        a.handle_key(KeyCode::KeyX); // unbound: no-op
+        assert_eq!(a.same_camera, 0);
+    }
 }
