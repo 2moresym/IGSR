@@ -1,0 +1,128 @@
+// IGSR compute prelude: no `#version` line here; the backend prepends one
+// (see backend::gl::compute_prelude).
+//
+// IGSR upscale pass — compute variant. Own implementation, same algorithm
+// as upscale.frag (Lanczos upsample + statistics box, history clamp,
+// temporal blend) at display resolution, but with an explicit history
+// buffer carrying per-pixel confidence in alpha:
+//   o_history = (blended rgb, confidence), o_scene = (blended rgb, 1).
+// History confidence = prior confidence carried forward, decayed by
+// disocclusion — the 3-pass quality story without extra buffers.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uniform sampler2D u_color;
+uniform sampler2D u_data;
+uniform sampler2D u_history;
+layout(binding = 0, rgba16f) uniform writeonly image2D o_scene;
+layout(binding = 1, rgba16f) uniform writeonly image2D o_history;
+
+uniform vec2 u_render_size;
+uniform vec2 u_render_rcp;
+uniform vec2 u_display_size;
+uniform vec2 u_display_rcp;
+uniform vec2 u_jitter;
+uniform float u_reset;
+uniform float u_min_lerp;
+uniform float u_full_taps;
+
+float tap_weight(vec2 d, float kb2) {
+    float base = clamp(dot(d, d) * kb2, 0.0, 1.0);
+    float y = base - 1.0;
+    float y2 = y * y;
+    return (0.75 * y + y2) * y2;
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(u_display_size.x) || px.y >= int(u_display_size.y)) {
+        return;
+    }
+    vec2 hruv = (vec2(px) + vec2(0.5)) * u_display_rcp;
+    vec2 juv = clamp(hruv + u_jitter * u_render_rcp, 0.0, 1.0);
+    ivec2 anchor = ivec2(juv * u_render_size);
+
+    vec4 md = textureLod(u_data, juv, 0.0);
+    vec2 motion = md.xy;
+    float disocc = md.z;
+
+    vec2 prev_uv = clamp(hruv - 0.5 * motion, 0.0, 1.0);
+    vec4 hp = textureLod(u_history, prev_uv, 0.0);
+    vec3 hist = hp.rgb;
+    float conf = clamp(abs(hp.a), 0.0, 1.0);
+
+    float ratio = min(u_display_size.x / u_render_size.x, 1.99);
+    float kern = clamp(conf + u_reset, 0.0, 1.0);
+    float kb = mix(ratio - ratio * kern, max(1.0, 0.3 + 0.3 * (ratio - ratio * kern)),
+                   max(0.25 * disocc, kern)) * 0.5;
+    float kb2 = kb * kb;
+    float motion_len = length(motion * u_display_size);
+    float curve = mix(-2.0, -3.0, clamp(motion_len * 0.02, 0.0, 1.0));
+
+    vec2 src = vec2(anchor) + vec2(0.5) - u_jitter;
+    vec2 rel = src - hruv * u_render_size;
+
+    const vec2 OFF[9] = vec2[9](
+        vec2(0.0, 0.0), vec2(1.0, 0.0), vec2(-1.0, 0.0),
+        vec2(0.0, 1.0), vec2(0.0, -1.0),
+        vec2(1.0, 1.0), vec2(-1.0, 1.0),
+        vec2(1.0, -1.0), vec2(-1.0, -1.0));
+
+    vec4 acc = vec4(0.0);
+    vec3 box_c = vec3(0.0), box_v = vec3(0.0), box_min, box_max;
+    float box_w = 0.0;
+    for (int i = 0; i < 9; i++) {
+        if (i >= 5 && u_full_taps < 0.5) {
+            break;
+        }
+        vec3 s = texelFetch(u_color, anchor + ivec2(OFF[i]), 0).rgb;
+        vec2 d = rel + OFF[i];
+        float w = tap_weight(d, kb2);
+        acc += vec4(s * w, w);
+        float bw = exp(dot(d, d) * curve);
+        if (i == 0) {
+            box_min = s;
+            box_max = s;
+        } else {
+            box_min = min(box_min, s);
+            box_max = max(box_max, s);
+        }
+        box_c += s * bw;
+        box_v += s * s * bw;
+        box_w += bw;
+    }
+    box_c /= box_w;
+    box_v = sqrt(abs(box_v / box_w - box_c * box_c));
+
+    vec3 up = clamp(acc.rgb / max(acc.w, 1e-6), box_min - 0.05, box_max + 0.05);
+    float uw = acc.w / 3.0;
+
+    float relax = max(disocc, clamp(motion_len * 0.05, 0.0, 1.0));
+    float box_scale = mix(ratio * ratio, 1.0, relax);
+    vec3 lo = max(box_min, box_c - box_v * box_scale);
+    vec3 hi = min(box_max, box_c + box_v * box_scale);
+
+    vec3 clamped = clamp(hist, lo, hi);
+    bool outside = any(lessThan(hist, lo)) || any(greaterThan(hist, hi));
+    float keep = 1.0;
+    if (outside) {
+        keep = u_min_lerp;
+        if (abs(motion.x) + abs(motion.y) > 1e-6) {
+            keep = 0.0;
+        }
+    }
+    vec3 h = mix(clamped, hist, keep);
+
+    float base = (1.0 - conf) * (1.0 - disocc);
+    base = min(base, mix(base, uw * 10.0, clamp(motion_len * 10.0, 0.0, 1.0)));
+    base = min(base, mix(base, uw, clamp(motion_len * 0.05, 0.0, 1.0)));
+    float alpha = clamp(uw / max(base + uw, 1.19e-07) + u_reset, 0.0, 1.0);
+    vec3 out_rgb = mix(h, up, alpha);
+    // Confidence carried forward: prior confidence survives where the pixel
+    // was stable, decays under disocclusion, resets on cut.
+    float out_conf = clamp(conf * (1.0 - disocc) + uw * 0.5, 0.0, 1.0) * (1.0 - u_reset)
+        + u_reset * uw;
+
+    imageStore(o_scene, px, vec4(out_rgb, 1.0));
+    imageStore(o_history, px, vec4(out_rgb, out_conf));
+}

@@ -1,4 +1,8 @@
 #include "../igsr.h"
 
-/* Stage 1 stub. Real work lands in stage 4 (upsample + temporal
- * accumulate, compute AND fragment variants). */
+/* Pass 2 — upscale (display-res, both variants). See
+ * shaders/upscale.{frag,comp} for the algorithm (own implementation):
+ * Lanczos upsample + statistics box, history clamp, temporal blend.
+ * Fragment variant writes one RGB target (history == previous output);
+ * compute variant writes scene + history/confidence images. Dispatch via
+ * igsr_display_dispatch(); selected by backend compute_path(). */

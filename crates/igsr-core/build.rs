@@ -7,7 +7,7 @@ fn main() {
             "src/params.c",
             "src/passes/pass1_reconstruct.c",
             "src/passes/pass2_upsample.c",
-            "src/passes/pass3_sharpen.c",
+            "src/passes/pass3_activate.c",
         ])
         .warnings(true)
         .flag_if_supported("-std=c11")
@@ -22,5 +22,5 @@ fn main() {
     println!("cargo:rerun-if-changed=src/igsr_priv.h");
     println!("cargo:rerun-if-changed=src/passes/pass1_reconstruct.c");
     println!("cargo:rerun-if-changed=src/passes/pass2_upsample.c");
-    println!("cargo:rerun-if-changed=src/passes/pass3_sharpen.c");
+    println!("cargo:rerun-if-changed=src/passes/pass3_activate.c");
 }

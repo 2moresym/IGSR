@@ -11,7 +11,13 @@ pub const TRIANGLE_FRAG: &str = include_str!("../shaders/triangle.frag");
 pub const CONVERT_FRAG: &str = include_str!("../shaders/convert.frag");
 pub const CONVERT_COMP: &str = include_str!("../shaders/convert.comp");
 
-// Stage 4 placeholders: reimplemented upscale (own code) lands next.
-pub const UPSCALE_COMP_STUB: &str = include_str!("../shaders/upscale.comp.stub");
-pub const UPSCALE_FRAG_STUB: &str = include_str!("../shaders/upscale.frag.stub");
+// Stage 4: reimplemented upscale (own code) + 3-pass activate (own code).
+// Upscale: one algorithm, two entry points — fragment (single RGB output,
+// history == previous output) and compute (explicit history/confidence
+// buffer). Activate: compute-only quality stage (temporal clip + luma
+// deltas), no `#version` line (backend prepends via compute_prelude),
+// same as CONVERT_COMP.
+pub const UPSCALE_FRAG: &str = include_str!("../shaders/upscale.frag");
+pub const UPSCALE_COMP: &str = include_str!("../shaders/upscale.comp");
+pub const ACTIVATE_COMP: &str = include_str!("../shaders/activate.comp");
 pub const FULLSCREEN_VERT: &str = include_str!("../shaders/fullscreen.vert");

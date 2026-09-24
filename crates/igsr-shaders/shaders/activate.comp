@@ -1,0 +1,82 @@
+// IGSR compute prelude: no `#version` line here; the backend prepends one
+// (see backend::gl::compute_prelude).
+//
+// IGSR activate pass — 3-pass quality stage. Own implementation; role
+// described in docs/ALGORITHM_NOTES.md §3: refine convert's disocclusion
+// factor with a temporal test and track per-pixel luma deltas so the
+// upscale pass can tell stable edges from shimmer.
+//
+// Differences from the studied design (deliberate): luma history is a plain
+// RG float texture (luma, signed delta), not bit-packed halves in R32UI —
+// integer image/atomics support is the riskiest item on crocus
+// (ALGORITHM_NOTES §6.4), and floats cost little at render resolution.
+// No transparency input yet (no opaque-color buffer until the testbed
+// renders transparents); the edge flag rides in o_data.w instead of an
+// alpha channel.
+//
+// I/O: u_data (motion.xy, spatial disocc, depth), u_color (render RGB),
+// u_luma_prev (RG float history) → o_data (motion.xy, combined clip,
+// edge flag), o_luma (RG float history). Convert's depth channel stays
+// available for debug views; upscale keys off the combined clip.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+uniform sampler2D u_data;
+uniform sampler2D u_color;
+uniform sampler2D u_luma_prev;
+layout(binding = 0, rgba16f) uniform writeonly image2D o_data;
+layout(binding = 1, rgba16f) uniform writeonly image2D o_luma;
+
+uniform vec2 u_render_size;
+uniform vec2 u_render_rcp;
+uniform float u_reset;
+
+float luma_of(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    if (px.x >= int(u_render_size.x) || px.y >= int(u_render_size.y)) {
+        return;
+    }
+    vec2 uv = (vec2(px) + vec2(0.5)) * u_render_rcp;
+
+    vec4 md = texelFetch(u_data, px, 0);
+    vec2 motion = md.xy;
+    float spatial = md.z;
+    float depth = md.w;
+
+    // Temporal test: where did this pixel come from? Outside the viewport
+    // means no valid history — fully disoccluded.
+    vec2 prev_uv = uv - 0.5 * motion;
+    bool inside = all(greaterThanEqual(prev_uv, vec2(0.0)))
+        && all(lessThanEqual(prev_uv, vec2(1.0)));
+    float clip = spatial;
+    if (!inside) {
+        clip = 1.0;
+    }
+
+    // Luma-delta tracking: a stable edge keeps its delta sign and shrinks
+    // toward the smaller magnitude; a sign flip marks shimmer (edge flag).
+    float cur = luma_of(texelFetch(u_color, px, 0).rgb);
+    vec2 prev = textureLod(u_luma_prev, clamp(prev_uv, 0.0, 1.0), 0.0).rg;
+    float out_luma = 0.0;
+    float out_delta = 0.0;
+    float edge = 0.0;
+    if (inside && clip + u_reset < 0.1) {
+        float delta = cur - prev.x;
+        if (prev.y != 0.0) {
+            if (sign(delta) == sign(prev.y)) {
+                delta = sign(delta) * min(abs(prev.y), abs(delta));
+            } else {
+                edge = 1.0;
+            }
+        }
+        out_luma = cur;
+        out_delta = delta;
+    }
+
+    imageStore(o_data, px, vec4(motion, clamp(clip, 0.0, 1.0), edge));
+    imageStore(o_luma, px, vec4(out_luma, out_delta, 0.0, 0.0));
+}

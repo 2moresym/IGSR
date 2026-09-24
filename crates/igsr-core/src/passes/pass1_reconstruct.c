@@ -1,6 +1,7 @@
 #include "../igsr.h"
 
-/* Stage 1 stub. Real work lands in stage 3 (convert/reconstruct):
- * depth-dilate + velocity-decode + RGB->YCoCg packing. Kept as a
- * separate TU so pass ordering / dispatch sizes can be unit-tested
- * before the GLSL exists. */
+/* Pass 1 — convert (render-res). See shaders/convert.{frag,comp} for the
+ * algorithm (own implementation): dilated depth, disocclusion factor,
+ * motion derivation. Dispatch sizing via igsr_render_dispatch(); uniform
+ * packing via igsr_fill_params(). No per-pass C dispatch code needed: the
+ * backend issues the draw/dispatch directly (stage 3 selftest proves it). */
