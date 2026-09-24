@@ -206,3 +206,37 @@ PrevLumaHistory ↔ LumaHistory **and** PrevHistory ↔ HistoryOutput.
 5. Testbed must supply: jittered camera + `clipToPrevClip` per frame,
    encoded velocity (or zeros for static scenes), depth, and exposure —
    all doable procedurally in stage 5.
+
+## 7. Stage 8C findings — motion handling re-read line by line
+
+Two questions, two answers.
+
+**Motion-vector dilation: checked, confirmed ABSENT.** All three converts
+sample velocity at the pixel's own texel; the "dilation" language in the
+reference comments ("using nearest depth for dilated motion",
+"FindNearestDepth") refers to depth-only nearest gathering that anchors
+the depth-reprojection fallback and the depthclip metric — never to
+pulling a neighbor's motion vector. Activate passes motion through
+untouched. Our chain already matches on all three points, so nothing was
+added for dilation. This item is closed, not a gap.
+
+**Temporal depth comparison in activate: checked, was MISSING, now
+implemented.** Reference activate gathers previous-frame depths around
+`PrevUV` with offset gathers on the depth channel (pairs at (-1,-1)/(-1,0)
+and (0,-1)/(0,0), `.zw` swizzle on the second of each pair, min-reduction,
+bilinear weights from the fractional position) and tests each against
+current depth with the Ksep separation metric
+(`Depthsep = Ksep·Kfov·diag·(1−min)`, `clamp(Depthsep/(|Δ|+eps))`),
+`depthclip = clamp(1−W)` with no 0.25 factor (unlike 2-pass convert).
+Notably it samples the *current* depth buffer at the reprojected UV —
+a single-buffer approximation, no previous-depth texture — and ours does
+the same against our convert-output depth channel. Two deliberate
+departures: (a) the result is unioned (`max`) with convert's spatial
+disocclusion instead of replacing it (reference 3-pass convert stores raw
+depth, so its activate is temporal-only; ours has both signals and keeps
+both); (b) the luma edge flag has a 1e-4 epsilon guard because our flag
+is binary while the reference's feeds a scaled alpha term where tiny
+deltas self-attenuate. Verified with the new clip debug view (key `C`):
+combined clip fires green on true silhouettes, edge flag red on luma sign
+flips, both black in 2-pass mode. Fast-motion dumps (`--spin 5`) show no
+ghosting trails on the spinning cube or moon.

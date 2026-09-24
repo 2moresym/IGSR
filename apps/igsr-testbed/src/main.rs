@@ -44,6 +44,7 @@ enum ViewMode {
     Split,
     Motion,
     Luma,
+    Clip,
 }
 
 impl ViewMode {
@@ -53,7 +54,8 @@ impl ViewMode {
             ViewMode::Native => ViewMode::Split,
             ViewMode::Split => ViewMode::Motion,
             ViewMode::Motion => ViewMode::Luma,
-            ViewMode::Luma => ViewMode::Upscaled,
+            ViewMode::Luma => ViewMode::Clip,
+            ViewMode::Clip => ViewMode::Upscaled,
         }
     }
     fn name(self) -> &'static str {
@@ -63,6 +65,7 @@ impl ViewMode {
             ViewMode::Split => "split native|upscaled",
             ViewMode::Motion => "motion/disocc debug",
             ViewMode::Luma => "luma-history debug",
+            ViewMode::Clip => "activate clip/edge debug",
         }
     }
 }
@@ -89,6 +92,7 @@ struct App {
     debug_events: bool,
     show_gpu: bool,
     scale: f32,
+    spin: f32,
     angle: f32,
     last_frame: std::time::Instant,
     same_camera: u32,
@@ -125,6 +129,7 @@ impl App {
             debug_events,
             show_gpu: true,
             scale: 0.5,
+            spin: 0.5,
             angle: 0.0,
             last_frame: now,
             same_camera: 0,
@@ -275,7 +280,7 @@ impl App {
             pipe.use_compute,
             self.three_pass && pipe.use_compute,
         );
-        eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | +/- scale | R reset | F compute/frag | T 2/3-pass | G gpu times");
+        eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | C clip/edge | +/- scale | R reset | F compute/frag | T 2/3-pass | G gpu times");
         eprintln!(
             "[testbed] timer queries: {}",
             if pipe.timers_supported() { "supported" } else { "UNSUPPORTED (overlay shows placeholder)" }
@@ -313,7 +318,7 @@ impl App {
 
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = std::time::Instant::now();
-        self.angle += dt * 0.5;
+        self.angle += dt * self.spin;
 
         let ctx = self.ctx.as_mut().unwrap();
         let pipe = self.pipeline.as_mut().unwrap();
@@ -389,6 +394,13 @@ impl App {
                 }
                 ViewMode::Luma => {
                     pipe.blit_region(gl, pipe.luma_tex_debug(), pipe.luma_prog(), 0, 0, ww, wh);
+                }
+                ViewMode::Clip => {
+                    if let Some(d) = pipe.data_tex_debug() {
+                        pipe.blit_region(gl, d, pipe.clip_prog(), 0, 0, ww, wh);
+                    } else {
+                        pipe.blit_to_screen(gl, out_tex, ww, wh);
+                    }
                 }
             }
         }
@@ -482,6 +494,10 @@ impl App {
             }
             KeyCode::KeyH => {
                 self.view = ViewMode::Luma;
+                self.print_status();
+            }
+            KeyCode::KeyC => {
+                self.view = ViewMode::Clip;
                 self.print_status();
             }
             KeyCode::Equal | KeyCode::NumpadAdd => {
@@ -621,6 +637,7 @@ fn main() {
             "split" => Some(ViewMode::Split),
             "motion" => Some(ViewMode::Motion),
             "luma" => Some(ViewMode::Luma),
+            "clip" => Some(ViewMode::Clip),
             _ => Some(ViewMode::Upscaled),
         })
         .unwrap_or(ViewMode::Upscaled);
@@ -651,6 +668,14 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(force_fallback, three_pass, selftest, dump_path, debug_events);
     app.view = init_view;
+    if let Some(sp) = args
+        .iter()
+        .position(|a| a == "--spin")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        app.spin = sp;
+    }
     if let Some(s) = args
         .iter()
         .position(|a| a == "--scale")
@@ -674,7 +699,7 @@ mod tests {
     fn view_cycles_all_modes() {
         let mut a = headless_app();
         let mut seen = vec![a.view];
-        for _ in 0..4 {
+        for _ in 0..5 {
             a.handle_key(KeyCode::KeyV);
             seen.push(a.view);
         }
@@ -686,6 +711,7 @@ mod tests {
                 ViewMode::Split,
                 ViewMode::Motion,
                 ViewMode::Luma,
+                ViewMode::Clip,
             ]
         );
         a.handle_key(KeyCode::KeyV);
@@ -699,6 +725,8 @@ mod tests {
         assert_eq!(a.view, ViewMode::Motion);
         a.handle_key(KeyCode::KeyH);
         assert_eq!(a.view, ViewMode::Luma);
+        a.handle_key(KeyCode::KeyC);
+        assert_eq!(a.view, ViewMode::Clip);
     }
 
     #[test]

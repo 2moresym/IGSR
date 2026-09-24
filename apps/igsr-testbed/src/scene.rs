@@ -198,18 +198,27 @@ impl Scene {
             if let Some(l) = loc("u_far") {
                 gl.uniform_1_f32(Some(&l), far);
             }
-            // Draw order: floor first, then cubes (depth test handles overlap).
-            let meshes = [&self.floor, &self.cube, &self.cube];
-            let order = [2usize, 0, 1];
-            for &oi in &order {
-                let mvp = mat4::mul(&vp, &models[oi]);
-                let mv = mat4::mul(view, &models[oi]);
-                let (pmvp, first) = if self.initialized {
-                    (mat4::mul(&self.prev_vp, &self.prev_models[oi]), false)
+            // Explicit (mesh, model) pairs. NOTE (stage 8C): this used to be
+            // two parallel arrays cut by one index list, which silently drew
+            // the cube mesh with the floor transform and vice versa — the
+            // "hero cube" never spun and the floor secretly rotated. It
+            // looked right in color because a spinning two-tone quad is
+            // nearly indistinguishable from a static floor; only the motion
+            // debug view exposed it (diverging velocity field on static
+            // geometry). Never index meshes and models separately again.
+            let draws = [
+                (&self.floor, &models[2], &self.prev_models[2]),
+                (&self.cube, &models[0], &self.prev_models[0]),
+                (&self.cube, &models[1], &self.prev_models[1]),
+            ];
+            for (mesh, model, prev_model) in draws {
+                let mvp = mat4::mul(&vp, model);
+                let mv = mat4::mul(view, model);
+                let pmvp = if self.initialized {
+                    mat4::mul(&self.prev_vp, prev_model)
                 } else {
-                    (mvp, true)
+                    mvp
                 };
-                let _ = first;
                 if let Some(l) = loc("u_mvp") {
                     gl.uniform_matrix_4_f32_slice(Some(&l), false, &mvp);
                 }
@@ -219,8 +228,8 @@ impl Scene {
                 if let Some(l) = loc("u_mv") {
                     gl.uniform_matrix_4_f32_slice(Some(&l), false, &mv);
                 }
-                gl.bind_vertex_array(Some(meshes[oi].vao));
-                gl.draw_elements(glow::TRIANGLES, meshes[oi].count, glow::UNSIGNED_INT, 0);
+                gl.bind_vertex_array(Some(mesh.vao));
+                gl.draw_elements(glow::TRIANGLES, mesh.count, glow::UNSIGNED_INT, 0);
             }
             gl.bind_vertex_array(None);
             gl.use_program(None);

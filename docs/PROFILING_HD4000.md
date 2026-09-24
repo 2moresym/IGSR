@@ -98,7 +98,6 @@ intel_gpu_top   # in another terminal while the testbed runs
 ```
 
 ## 7. Keybind testing (stage 8B verdict: closed, not tool-fixable here)
-
 Live keypresses cannot be automated on this box, verified twice:
 
 - `wtype` (Wayland virtual-keyboard): input never reaches the testbed
@@ -126,3 +125,22 @@ Keys in the window: `V` cycle views, `M` motion, `H` luma-history,
 compute/fragment toggle, `T` 2/3-pass toggle, `G` gpu-times overlay.
 Headless flags: `--scale`, `--view`, `--dump`, `--selftest`,
 `--debug-events`, `--force-fallback`, `--three-pass`.
+
+## 8. Correction: the scene was scrambled until stage 8C (read this before
+trusting pre-8C temporal claims)
+
+The scene draw loop indexed the mesh and model arrays with one shared
+index list, which drew the cube mesh with the floor transform and vice
+versa: the "hero cube" never spun, and the floor secretly rotated. It
+looked right in color (a spinning two-tone quad is nearly
+indistinguishable from a static floor) and survived since stage 5. Only
+the motion debug view exposed it — a diverging velocity field on static
+geometry is unmistakable. Fixed with explicit (mesh, model) pairs (see the
+comment in `scene.rs`); the motion view now shows jitter-level floor/sky
+plus true tangential motion on the cube.
+
+Consequence: every "no ghosting / temporally stable" observation before
+this fix was made on a near-static scene (moon + jitter only) and counts
+as weak evidence. Re-verified after the fix with `--spin 5` fast-motion
+dumps (upscaled, motion, clip views) — clean, no trails. Trust the post-8C
+captures, not the older ones.

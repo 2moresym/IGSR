@@ -47,6 +47,20 @@ void main() {
 }
 ";
 
+// Debug view: activate output (combined disocclusion clip as green, luma
+// edge flag as red). Reads the same buffer the motion view reads, so in
+// 3-pass mode Motion shows (motion, combined clip) while this shows
+// (edge, clip). Black in 2-pass mode (activate never runs).
+const CLIP_FRAG: &str = "#version 420 core
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_col;
+uniform sampler2D u_tex;
+void main() {
+    vec4 d = texture(u_tex, v_uv);
+    o_col = vec4(d.w, d.z, 0.0, 1.0);
+}
+";
+
 fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
@@ -305,6 +319,7 @@ pub struct Pipeline {
     blit_prog: glow::NativeProgram,
     motion_prog: glow::NativeProgram,
     luma_prog: glow::NativeProgram,
+    clip_prog: glow::NativeProgram,
     convert_comp: Option<glow::NativeProgram>,
     upscale_comp: Option<glow::NativeProgram>,
     activate_comp: Option<glow::NativeProgram>,
@@ -336,6 +351,8 @@ impl Pipeline {
                 gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, MOTION_FRAG)?;
             let luma_prog =
                 gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, LUMA_FRAG)?;
+            let clip_prog =
+                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, CLIP_FRAG)?;
 
             // Compute programs (prelude + body). Any failure → fragment path.
             let prelude = gl_backend::compute_prelude(gl_major, gl_minor, backend_compute);
@@ -404,6 +421,7 @@ impl Pipeline {
                 blit_prog,
                 motion_prog,
                 luma_prog,
+                clip_prog,
                 convert_comp,
                 upscale_comp,
                 activate_comp,
@@ -484,6 +502,22 @@ impl Pipeline {
             self.last_data = None;
             self.scene_out_tex =
                 tex2d(gl, glow::RGBA16F as i32, dw, dh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::NEAREST);
+            // Clear debug-visible buffers that no pass writes in 2-pass mode
+            // (activate output + luma history), so the clip/luma views read
+            // black instead of uninitialized memory. Luma has no FBO of its
+            // own; clear it through act_fbo's second attachment.
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.act_fbo));
+            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+            gl.clear_color(0.0, 0.0, 0.0, 0.0);
+            gl.clear(glow::COLOR_BUFFER_BIT);
+            for i in 0..2 {
+                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, Some(self.luma_tex[i]), 0);
+                gl.draw_buffers(&[glow::COLOR_ATTACHMENT1]);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, None, 0);
+            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.needs_reset = true;
         }
     }
@@ -658,6 +692,9 @@ impl Pipeline {
                 if let Some(l) = Self::uni(gl, prog, "u_reset") {
                     gl.uniform_1_f32(Some(&l), p.reset as f32);
                 }
+                if let Some(l) = Self::uni(gl, prog, "u_fov_hor") {
+                    gl.uniform_1_f32(Some(&l), p.camera_fov_hor);
+                }
                 let lw = 1 - self.luma_read;
                 gl.bind_image_texture(0, Some(self.data2_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
                 gl.bind_image_texture(1, Some(self.luma_tex[lw]), 0, false, 0, glow::WRITE_ONLY, glow::RG16F);
@@ -769,6 +806,9 @@ impl Pipeline {
     }
     pub fn luma_prog(&self) -> glow::NativeProgram {
         self.luma_prog
+    }
+    pub fn clip_prog(&self) -> glow::NativeProgram {
+        self.clip_prog
     }
     pub fn scene_color_tex(&self) -> glow::NativeTexture {
         self.scene_color

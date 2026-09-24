@@ -3,8 +3,17 @@
 //
 // IGSR activate pass — 3-pass quality stage. Own implementation; role
 // described in docs/ALGORITHM_NOTES.md §3: refine convert's disocclusion
-// factor with a temporal test and track per-pixel luma deltas so the
+// factor with a temporal depth test and track per-pixel luma deltas so the
 // upscale pass can tell stable edges from shimmer.
+//
+// The temporal test mirrors the reference's gather pattern (stage 8C):
+// previous-frame depths are gathered around PrevUV with offset gathers and
+// bilinear weights, then tested against current depth with the Ksep
+// separation metric. Like the reference, this samples the current depth
+// buffer at the reprojected UV (single-buffer approximation — no separate
+// previous-depth texture). Unlike the reference, the result is unioned
+// (max) with convert's spatial disocclusion instead of replacing it, since
+// ours exists and is valid signal; see ALGORITHM_NOTES §7.
 //
 // Differences from the studied design (deliberate): luma history is a plain
 // RG float texture (luma, signed delta), not bit-packed halves in R32UI —
@@ -30,9 +39,24 @@ layout(binding = 1, rg16f) uniform writeonly image2D o_luma;
 uniform vec2 u_render_size;
 uniform vec2 u_render_rcp;
 uniform float u_reset;
+uniform float u_fov_hor; // horizontal FOV factor for the Ksep metric
+
+const float K_SEP = 1.4e-05; // same separation sensitivity as convert
+const float EPS = 1.19e-07;
 
 float luma_of(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+float quad_min(vec4 g) {
+    return min(min(g.x, g.y), min(g.z, g.w));
+}
+
+// One bilinear-weighted depth-agreement term. f_prev is the gathered
+// previous depth reduced to a minimum, w is this tap's bilinear weight.
+float agree(float f_prev, float depth, float sep_scale, float w) {
+    float sep = sep_scale * (1.0 - min(f_prev, depth));
+    return clamp(sep / (abs(f_prev - depth) + EPS), 0.0, 1.0) * w;
 }
 
 void main() {
@@ -52,7 +76,42 @@ void main() {
     vec2 prev_uv = uv - 0.5 * motion;
     bool inside = all(greaterThanEqual(prev_uv, vec2(0.0)))
         && all(lessThanEqual(prev_uv, vec2(1.0)));
-    float clip = spatial;
+
+    // Temporal depth comparison (reference gather pattern): gather previous
+    // depths around PrevUV with offset gathers on the depth channel,
+    // weight by bilinear position, test each against current depth.
+    float temporal = 0.0;
+    if (inside && depth < 1.0 - 1.0e-05) {
+        vec2 prev_f = prev_uv * u_render_size - vec2(0.5);
+        vec2 fr = prev_f - floor(prev_f);
+        float bw[4] = float[4](
+            (1.0 - fr.x) * (1.0 - fr.y),
+            fr.x * (1.0 - fr.y),
+            (1.0 - fr.x) * fr.y,
+            fr.x * fr.y);
+        float sep_scale = K_SEP * u_fov_hor * length(u_render_size);
+        float wsum = 0.0;
+        // Pair 0: gathers at (-1,-1) and (-1,0).
+        vec4 g0 = textureGatherOffset(u_data, prev_uv, ivec2(-1, -1), 3);
+        float f0 = quad_min(g0);
+        wsum += agree(f0, depth, sep_scale, bw[0]);
+        vec2 g0b = textureGatherOffset(u_data, prev_uv, ivec2(-1, 0), 3).zw;
+        float f0b = min(min(g0b.x, g0b.y), min(g0.z, g0.w));
+        wsum += agree(f0b, depth, sep_scale, bw[1]);
+        // Pair 1: gathers at (0,-1) and (0,0).
+        vec4 g1 = textureGatherOffset(u_data, prev_uv, ivec2(0, -1), 3);
+        float f1 = quad_min(g1);
+        wsum += agree(f1, depth, sep_scale, bw[2]);
+        vec2 g1b = textureGatherOffset(u_data, prev_uv, ivec2(0, 0), 3).zw;
+        float f1b = min(min(g1b.x, g1b.y), min(g1.z, g1.w));
+        wsum += agree(f1b, depth, sep_scale, bw[3]);
+        temporal = clamp(1.0 - wsum, 0.0, 1.0);
+    }
+
+    // Union of both tests (deliberate departure: the reference's convert
+    // stores raw depth so its activate is temporal-only; ours keeps the
+    // spatial term — dropping valid signal for parity would be worse).
+    float clip = max(spatial, temporal);
     if (!inside) {
         clip = 1.0;
     }
@@ -66,7 +125,11 @@ void main() {
     float edge = 0.0;
     if (inside && clip + u_reset < 0.1) {
         float delta = cur - prev.x;
-        if (prev.y != 0.0) {
+        // Epsilon guard: without it, sub-quantization flicker on smooth
+        // gradients (delta ~ 1e-5, sign random) flags edges everywhere.
+        // The studied design has no guard, but its flag feeds a scaled
+        // alpha term where tiny deltas self-attenuate; ours is binary.
+        if (prev.y != 0.0 && abs(delta) > 1.0e-04) {
             if (sign(delta) == sign(prev.y)) {
                 delta = sign(delta) * min(abs(prev.y), abs(delta));
             } else {
