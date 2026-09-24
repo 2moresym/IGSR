@@ -21,38 +21,44 @@ commands here after any shader or pipeline change.
   - [ ] `--force-fallback` (or live key `F`) → `path=FragmentFallback`,
         image still correct (compare `--dump` outputs of both paths)
 
-## 2. Numbers so far (and why they don't conclude anything yet)
+## 2. Numbers (stage 8A: measured with timer queries, no more guessing)
 
-At 677x760 window, scale 0.5 (338x380 → 677x760), vsync on:
+`GL_ARB_timer_query` **is supported** on crocus 4.2. Each pass is wrapped in
+`TIME_ELAPSED` queries (`PassTimers` in `pipeline.rs`: 3 in-flight slots
+per pass, results consumed 1–2 frames late, EMA overlay, `G` toggles the
+readout). Fragment path, 677x760 display:
 
-| path | fps |
-| ---- | --- |
-| fragment 2-pass | ~58 |
-| compute 3-pass | ~59 |
+| render scale | convert | upscale | total |
+| ------------ | ------- | ------- | ----- |
+| 0.50 (338x380) | 0.39ms | 3.23ms | 3.58ms |
+| 0.75 (507x570) | 0.90ms | 3.57ms | 4.29ms |
+| 1.00 (677x760) | 1.60ms | 3.53ms | 5.02ms |
 
-Both sit at the vsync ceiling — the swap interval (`SwapInterval::Wait(1)`
-in `init_gl`) caps the loop, so these numbers prove *correctness under
-load*, not relative speed. To actually compare paths on this box:
+Reads as: convert scales with render pixels (real work), upscale is flat
+(display-res work at fixed window size), totals self-sum. Trustworthy.
 
-1. Temporarily switch to `SwapInterval::DontWait` (one line in
-   `apps/igsr-testbed/src/main.rs`), re-run both paths, compare the
-   printed fps; and/or grow the window (render cost scales with pixels —
-   try 1280x720 and 1920x1080 display with `-`/`+` scale sweeps).
-2. Watch `intel_gpu_top` (package `intel-gpu-tools`) while running: 3D
-   busy %, and whether the compute path changes the render-vs-compute
-   balance crocus reports.
+Compute path on this driver is **not measurable per-pass**: the first timed
+query per frame reads ~6.5ms while activate/upscale read exactly 0.00,
+even given whole frames to themselves. The 6.5ms barely moves when render
+pixels quadruple (6.42 → 6.69ms), so it is a fixed per-frame cost — most
+likely a full-pipeline drain triggered by the first compute dispatch after
+fragment work — not the pass cost. Related finding: nested TIME_ELAPSED
+queries mis-attribute on crocus (the outer query steals the inner's time),
+so each query gets its own frame (rotating Convert → Upscale → Activate →
+Total). Follow-ups if compute numbers are ever needed: `TIMESTAMP`
+query-counter pairs (different driver path), or `intel_gpu_top` coarse
+signal. Until then, compare paths with the fragment timings + `--dump`
+image agreement, not the compute query readouts.
 
-## 3. Per-pass GPU timings — not yet instrumented (known gap)
+Fps is still vsync-capped (~59); the ms numbers above are the real signal.
 
-The fps overlay is CPU frame time only. The hooks for real timings:
+## 3. Per-pass GPU timings — instrumented (stage 8A)
 
-- Wrap each pass in `pipeline.rs::execute` (`convert`, `activate`,
-  `upscale` sections) with `GL_TIME_ELAPSED` queries
-  (`gen_queries`, `begin_query`/`end_query`, read back 2 frames late to
-  avoid stalls). crocus supports `GL_ARB_timer_query` on IVB — verify
-  with the extension list first.
-- Until then: use `--dump` frame captures + `intel_gpu_top` as the
-  coarse signal, and the selftest readbacks as the correctness signal.
+Covered by §2 above. Remaining gap: trustworthy *compute* per-pass numbers
+(see the drain finding). The hooks live in `pipeline.rs::execute`
+(`PassTimers::begin/end` around each pass); re-verify with `--selftest`
+adjacent runs after any change. `intel_gpu_top` remains the coarse
+cross-check while the testbed runs.
 
 ## 4. Correctness checks that already run here
 
@@ -93,4 +99,6 @@ intel_gpu_top   # in another terminal while the testbed runs
 
 Keys in the window: `V` cycle views, `M` motion, `H` luma-history,
 `+`/`-` live scale, `R` history reset (camera-cut path), `F`
-compute/fragment toggle, `T` 2/3-pass toggle.
+compute/fragment toggle, `T` 2/3-pass toggle, `G` gpu-times overlay.
+Headless flags: `--scale`, `--view`, `--dump`, `--selftest`,
+`--debug-events`, `--force-fallback`, `--three-pass`.

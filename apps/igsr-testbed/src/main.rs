@@ -30,6 +30,12 @@ use winit::window::Window;
 use igsr::backend::gl::{detect_compute, GlBackend};
 use igsr::backend::GpuBackend;
 
+/// Timer queries are core since GL 3.3; on older/odd drivers require the
+/// extension string. Pure helper so the gating rule is obvious.
+fn timer_supported(extensions: &str) -> bool {
+    extensions.split_whitespace().any(|e| e == "GL_ARB_timer_query")
+}
+
 /// Stage-6 view modes (key V cycles; M/H jump directly).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ViewMode {
@@ -81,6 +87,7 @@ struct App {
     dump_path: Option<String>,
     view: ViewMode,
     debug_events: bool,
+    show_gpu: bool,
     scale: f32,
     angle: f32,
     last_frame: std::time::Instant,
@@ -116,6 +123,7 @@ impl App {
             dump_path,
             view: ViewMode::Upscaled,
             debug_events,
+            show_gpu: true,
             scale: 0.5,
             angle: 0.0,
             last_frame: now,
@@ -249,6 +257,7 @@ impl App {
                 min,
                 backend.supports_compute(),
                 self.three_pass,
+                timer_supported(&extensions),
                 rw,
                 rh,
                 dw,
@@ -266,7 +275,11 @@ impl App {
             pipe.use_compute,
             self.three_pass && pipe.use_compute,
         );
-        eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | +/- scale | R reset | F compute/frag | T 2/3-pass");
+        eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | +/- scale | R reset | F compute/frag | T 2/3-pass | G gpu times");
+        eprintln!(
+            "[testbed] timer queries: {}",
+            if pipe.timers_supported() { "supported" } else { "UNSUPPORTED (overlay shows placeholder)" }
+        );
         self.backend_compute = backend.supports_compute();
 
         self.window = Some(window);
@@ -416,7 +429,12 @@ impl App {
         self.frames += 1;
         if self.frames % 600 == 0 {
             let fps = self.frames as f32 / self.start.elapsed().as_secs_f32();
-            eprintln!("[testbed] ~{fps:.1} fps over {} frames ({}x{} -> {}x{})", self.frames, rw, rh, dw, dh);
+            let gpu = if self.show_gpu {
+                pipe.timers_report()
+            } else {
+                String::new()
+            };
+            eprintln!("[testbed] ~{fps:.1} fps over {} frames ({}x{} -> {}x{}) {}", self.frames, rw, rh, dw, dh, gpu);
         }
     }
 
@@ -433,8 +451,13 @@ impl App {
         } else {
             2
         };
+        let gpu = if self.show_gpu {
+            self.pipeline.as_ref().map(|p| p.timers_report()).unwrap_or_default()
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[testbed] view={} scale={:.2} ({}x{}->{}x{}) path={} passes={}",
+            "[testbed] view={} scale={:.2} ({}x{}->{}x{}) path={} passes={} {}",
             self.view.name(),
             self.scale,
             rw,
@@ -442,7 +465,8 @@ impl App {
             dw,
             dh,
             path,
-            passes
+            passes,
+            gpu
         );
     }
 
@@ -498,6 +522,10 @@ impl App {
                     self.same_camera = 0;
                     eprintln!("[testbed] three_pass={}", p.three_pass);
                 }
+                self.print_status();
+            }
+            KeyCode::KeyG => {
+                self.show_gpu = !self.show_gpu;
                 self.print_status();
             }
             _ => {}
@@ -623,6 +651,14 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(force_fallback, three_pass, selftest, dump_path, debug_events);
     app.view = init_view;
+    if let Some(s) = args
+        .iter()
+        .position(|a| a == "--scale")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        app.scale = s.clamp(0.25, 1.0);
+    }
     event_loop.run_app(&mut app).expect("run_app");
 }
 
@@ -687,6 +723,10 @@ mod tests {
         a.handle_key(KeyCode::KeyR);
         a.handle_key(KeyCode::KeyF);
         a.handle_key(KeyCode::KeyT);
+        a.handle_key(KeyCode::KeyG);
+        assert!(!a.show_gpu);
+        a.handle_key(KeyCode::KeyG);
+        assert!(a.show_gpu);
         a.handle_key(KeyCode::KeyX); // unbound: no-op
         assert_eq!(a.same_camera, 0);
     }

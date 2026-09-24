@@ -51,6 +51,200 @@ fn f32_bytes(v: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
 }
 
+// ---- Per-pass GPU timers (stage 8A) ----
+
+/// Passes we time. Order matches the report and the ms/valid/ema arrays.
+/// `Total` brackets the whole execute (the only trustworthy number when the
+/// driver mis-reports individual compute passes — see PROFILING_HD4000.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassId {
+    Convert = 0,
+    Activate = 1,
+    Upscale = 2,
+    Total = 3,
+}
+
+const N_TIMED: usize = 4;
+
+/// GL_ARB_timer_query instrumentation with 3 in-flight slots per pass, so
+/// results are consumed 1–2 frames late and never stall the pipeline.
+/// `u32` nanosecond reads are used deliberately: per-pass times are
+/// millisecond-scale (no wrap risk below ~4s), which avoids glow's awkward
+/// pointer-based u64 getter.
+pub struct PassTimers {
+    supported: bool,
+    slots: [[Option<glow::NativeQuery>; 3]; N_TIMED],
+    cursor: [usize; N_TIMED],
+    consumed: [[bool; 3]; N_TIMED],
+    ms: [f32; N_TIMED],
+    ema_ms: [f32; N_TIMED],
+    valid: [bool; N_TIMED],
+    /// Bit p set = pass p is skipped this frame. The driver gets at most
+    /// one active query per frame (see PROFILING_HD4000.md §2).
+    mask: u8,
+}
+
+impl PassTimers {
+    pub unsafe fn new(gl: &glow::Context, supported: bool) -> PassTimers {
+        let mut t = PassTimers {
+            supported,
+            slots: [[None, None, None]; N_TIMED],
+            cursor: [0; N_TIMED],
+            consumed: [[true, true, true]; N_TIMED],
+            ms: [0.0; N_TIMED],
+            ema_ms: [0.0; N_TIMED],
+            valid: [false; N_TIMED],
+            mask: 0,
+        };
+        if !supported {
+            return t;
+        }
+        unsafe {
+            for p in 0..N_TIMED {
+                for s in 0..3 {
+                    match gl.create_query() {
+                        Ok(q) => t.slots[p][s] = Some(q),
+                        Err(_) => {
+                            t.supported = false;
+                            return t;
+                        }
+                    }
+                }
+            }
+        }
+        t
+    }
+
+    pub fn supported(&self) -> bool {
+        self.supported
+    }
+
+    /// Start timing `pass`. No-op when masked (another pass owns this frame).
+    pub unsafe fn begin(&mut self, gl: &glow::Context, pass: PassId) {
+        if !self.supported || (self.mask & (1 << pass as u8)) != 0 {
+            return;
+        }
+        unsafe {
+            let p = pass as usize;
+            let s = self.cursor[p];
+            self.cursor[p] = (s + 1) % 3;
+            self.consumed[p][s] = false;
+            if let Some(q) = self.slots[p][s] {
+                gl.begin_query(glow::TIME_ELAPSED, q);
+            }
+        }
+    }
+
+    /// Stop timing. Same mask rule as begin (a skipped begin must pair
+    /// with a skipped end — the pair always matches by construction).
+    pub unsafe fn end(&self, gl: &glow::Context, pass: PassId) {
+        if !self.supported || (self.mask & (1 << pass as u8)) != 0 {
+            return;
+        }
+        unsafe {
+            gl.end_query(glow::TIME_ELAPSED);
+        }
+    }
+
+    /// Harvest available results without blocking. Call once per frame
+    /// (start of execute); updates last + EMA milliseconds per pass.
+    pub unsafe fn poll(&mut self, gl: &glow::Context) {
+        if !self.supported {
+            return;
+        }
+        unsafe {
+            for p in 0..N_TIMED {
+                for s in 0..3 {
+                    if self.consumed[p][s] {
+                        continue;
+                    }
+                    if let Some(q) = self.slots[p][s] {
+                        if gl.get_query_parameter_u32(q, glow::QUERY_RESULT_AVAILABLE) != 0 {
+                            let ns = gl.get_query_parameter_u32(q, glow::QUERY_RESULT);
+                            let ms = ns as f32 / 1e6;
+                            self.ms[p] = ms;
+                            self.ema_ms[p] = if self.valid[p] {
+                                self.ema_ms[p] * 0.95 + ms * 0.05
+                            } else {
+                                ms
+                            };
+                            self.valid[p] = true;
+                            self.consumed[p][s] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn ema(&self, pass: PassId) -> Option<f32> {
+        let v = self.valid[pass as usize];
+        v.then_some(self.ema_ms[pass as usize])
+    }
+
+    /// One-line overlay fragment, e.g. `gpu=[convert 0.42ms upscale 1.10ms
+    /// total 1.60ms]`. Activate is shown only once it has produced a sample
+    /// (3-pass runs).
+    pub fn report(&self) -> String {
+        format_report(
+            self.supported,
+            self.ema(PassId::Convert),
+            self.ema(PassId::Activate),
+            self.ema(PassId::Upscale),
+            self.ema(PassId::Total),
+        )
+    }
+}
+
+/// Pure report formatting (unit-tested without GL).
+fn format_report(
+    supported: bool,
+    convert_ms: Option<f32>,
+    activate_ms: Option<f32>,
+    upscale_ms: Option<f32>,
+    total_ms: Option<f32>,
+) -> String {
+    if !supported {
+        return "gpu=[timer queries unsupported]".into();
+    }
+    let mut s = String::from("gpu=[");
+    s.push_str(&format!("convert {} ", fmt_ms(convert_ms)));
+    if activate_ms.is_some() {
+        s.push_str(&format!("activate {} ", fmt_ms(activate_ms)));
+    }
+    s.push_str(&format!("upscale {} ", fmt_ms(upscale_ms)));
+    s.push_str(&format!("total {}]", fmt_ms(total_ms)));
+    s
+}
+
+fn fmt_ms(v: Option<f32>) -> String {
+    match v {
+        Some(ms) => format!("{ms:.2}ms"),
+        None => "--".into(),
+    }
+}
+
+#[cfg(test)]
+mod timer_tests {
+    use super::format_report;
+
+    #[test]
+    fn report_formats() {
+        assert_eq!(
+            format_report(false, None, None, None, None),
+            "gpu=[timer queries unsupported]"
+        );
+        assert_eq!(
+            format_report(true, Some(0.424), None, Some(1.096), Some(1.62)),
+            "gpu=[convert 0.42ms upscale 1.10ms total 1.62ms]"
+        );
+        assert_eq!(
+            format_report(true, Some(0.424), Some(0.1), None, None),
+            "gpu=[convert 0.42ms activate 0.10ms upscale -- total --]"
+        );
+    }
+}
+
 fn tex2d(
     gl: &glow::Context,
     internal: i32,
@@ -103,6 +297,8 @@ pub struct Pipeline {
     last_data: Option<glow::NativeTexture>,
     // Compute-path scene copy (display res; also feeds stage-6 debug views).
     scene_out_tex: glow::NativeTexture,
+    timers: PassTimers,
+    timer_frame: u64,
     // Programs.
     convert_frag: glow::NativeProgram,
     upscale_frag: glow::NativeProgram,
@@ -123,6 +319,7 @@ impl Pipeline {
         gl_minor: u32,
         backend_compute: bool,
         three_pass: bool,
+        timer_supported: bool,
         rw: u32,
         rh: u32,
         dw: u32,
@@ -200,6 +397,8 @@ impl Pipeline {
                 hist_read: 0,
                 last_data: None,
                 scene_out_tex: gl.create_texture().unwrap(),
+                timers: PassTimers::new(gl, timer_supported),
+                timer_frame: 0,
                 convert_frag,
                 upscale_frag,
                 blit_prog,
@@ -374,6 +573,21 @@ impl Pipeline {
     /// texture (a history buffer, valid until the next execute).
     pub unsafe fn execute(&mut self, gl: &glow::Context, p: &IgsrParamsFfi) -> glow::NativeTexture {
         unsafe {
+            self.timers.poll(gl);
+            // One timed pass per frame, rotating Convert → Upscale →
+            // Activate → Total. Back-to-back TIME_ELAPSED queries mis-report
+            // on crocus (nested queries starve the inner ones); giving each
+            // query a whole frame keeps every reading trustworthy.
+            // EMA converges ~4x slower — acceptable for an overlay number.
+            const ALL: u8 = 0b1111;
+            self.timers.mask = match self.timer_frame % 4 {
+                0 => ALL & !(1 << PassId::Convert as u8),
+                1 => ALL & !(1 << PassId::Upscale as u8),
+                2 => ALL & !(1 << PassId::Activate as u8),
+                _ => ALL & !(1 << PassId::Total as u8),
+            };
+            self.timer_frame += 1;
+            self.timers.begin(gl, PassId::Total);
             let three = self.three_pass && self.use_compute && self.activate_comp.is_some();
             if self.three_pass && !three && !self.three_warned {
                 self.three_warned = true;
@@ -387,6 +601,7 @@ impl Pipeline {
             // ---- Convert ----
             if self.use_compute {
                 let prog = self.convert_comp.unwrap();
+                self.timers.begin(gl, PassId::Convert);
                 gl.use_program(Some(prog));
                 Self::bind_tex(gl, 0, self.scene_depth);
                 Self::bind_tex(gl, 1, self.scene_vel);
@@ -400,10 +615,12 @@ impl Pipeline {
                 gl.bind_image_texture(0, Some(self.data_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
                 gl.dispatch_compute(gx, gy, 1);
                 Self::barrier(gl);
+                self.timers.end(gl, PassId::Convert);
                 gl.use_program(None);
             } else {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.convert_fbo));
                 gl.viewport(0, 0, self.rw as i32, self.rh as i32);
+                self.timers.begin(gl, PassId::Convert);
                 gl.use_program(Some(self.convert_frag));
                 Self::bind_tex(gl, 0, self.scene_depth);
                 Self::bind_tex(gl, 1, self.scene_vel);
@@ -415,12 +632,14 @@ impl Pipeline {
                 }
                 Self::set_convert_uniforms(gl, self.convert_frag, p);
                 Self::draw_full(gl, self.blit_vao);
+                self.timers.end(gl, PassId::Convert);
                 gl.use_program(None);
             }
 
             // ---- Activate (3-pass, compute-only) ----
             let data_for_upscale = if three {
                 let prog = self.activate_comp.unwrap();
+                self.timers.begin(gl, PassId::Activate);
                 gl.use_program(Some(prog));
                 Self::bind_tex(gl, 0, self.data_tex);
                 Self::bind_tex(gl, 1, self.scene_color);
@@ -444,6 +663,7 @@ impl Pipeline {
                 gl.bind_image_texture(1, Some(self.luma_tex[lw]), 0, false, 0, glow::WRITE_ONLY, glow::RG16F);
                 gl.dispatch_compute(gx, gy, 1);
                 Self::barrier(gl);
+                self.timers.end(gl, PassId::Activate);
                 gl.use_program(None);
                 self.luma_read = lw;
                 self.data2_tex
@@ -455,6 +675,7 @@ impl Pipeline {
             let hw = 1 - self.hist_read;
             if self.use_compute {
                 let prog = self.upscale_comp.unwrap();
+                self.timers.begin(gl, PassId::Upscale);
                 gl.use_program(Some(prog));
                 Self::bind_tex(gl, 0, self.scene_color);
                 Self::bind_tex(gl, 1, data_for_upscale);
@@ -469,10 +690,12 @@ impl Pipeline {
                 gl.bind_image_texture(1, Some(self.scene_out_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
                 gl.dispatch_compute(dx, dy, 1);
                 Self::barrier(gl);
+                self.timers.end(gl, PassId::Upscale);
                 gl.use_program(None);
             } else {
                 gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.hist_fbo[hw]));
                 gl.viewport(0, 0, self.dw as i32, self.dh as i32);
+                self.timers.begin(gl, PassId::Upscale);
                 gl.use_program(Some(self.upscale_frag));
                 Self::bind_tex(gl, 0, self.scene_color);
                 Self::bind_tex(gl, 1, data_for_upscale);
@@ -484,11 +707,13 @@ impl Pipeline {
                 }
                 Self::set_upscale_uniforms(gl, self.upscale_frag, p);
                 Self::draw_full(gl, self.blit_vao);
+                self.timers.end(gl, PassId::Upscale);
                 gl.use_program(None);
             }
             self.hist_read = hw;
             self.needs_reset = false;
             self.last_data = Some(data_for_upscale);
+            self.timers.end(gl, PassId::Total);
             self.hist_tex[self.hist_read]
         }
     }
@@ -560,5 +785,12 @@ impl Pipeline {
     /// Compute dispatch is usable only if both compute programs compiled.
     pub fn can_compute(&self) -> bool {
         self.convert_comp.is_some() && self.upscale_comp.is_some()
+    }
+    /// Current per-pass GPU timings overlay fragment (stage 8A).
+    pub fn timers_report(&self) -> String {
+        self.timers.report()
+    }
+    pub fn timers_supported(&self) -> bool {
+        self.timers.supported()
     }
 }
