@@ -1,0 +1,4 @@
+#version 430 core
+// STUB — reimplemented convert (pass 1) lands in stage 3.
+// Kept as a file so build wiring can be tested before the math exists.
+void main() {}

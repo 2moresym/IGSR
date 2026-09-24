@@ -1,0 +1,6 @@
+[package]
+name = "igsr-sys"
+version.workspace = true
+edition.workspace = true
+[dependencies]
+igsr-core = { path = "../igsr-core" }

@@ -1,0 +1,10 @@
+[package]
+name = "igsr-core"
+version.workspace = true
+edition.workspace = true
+links = "igsr_core"
+[build-dependencies]
+cc = "1.2"
+
+[lib]
+path = "src/lib.rs"

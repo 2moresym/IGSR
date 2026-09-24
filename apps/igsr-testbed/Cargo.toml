@@ -1,0 +1,18 @@
+[package]
+name = "igsr-testbed"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "igsr-testbed"
+path = "src/main.rs"
+
+[dependencies]
+igsr = { path = "../../crates/igsr" }
+igsr-sys = { path = "../../crates/igsr-sys" }
+igsr-shaders = { path = "../../crates/igsr-shaders" }
+glow = "0.16"
+winit = "0.30"
+glutin = "0.32"
+glutin-winit = "0.5"
+raw-window-handle = "0.6"

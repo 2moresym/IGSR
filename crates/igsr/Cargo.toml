@@ -1,0 +1,14 @@
+[package]
+name = "igsr"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+igsr-sys = { path = "../igsr-sys" }
+igsr-shaders = { path = "../igsr-shaders" }
+glow = "0.16"
+
+[features]
+default = []
+# Future Vireo/Lake integration point. No code behind it yet (stage 1 stub).
+vireo = []

@@ -1,0 +1,3 @@
+#version 430 core
+// STUB — reimplemented upscale (pass 2) lands in stage 4.
+void main() {}
