@@ -74,6 +74,42 @@ practice, shader-level upscale work buys nothing observable at this
 window size. Optimization (step 4) should target bigger windows/scales
 first, or the CPU-side submission cost — not upscale's shader code yet.
 
+### Stage 10 continued: release build, CPU audit, crossover sweep
+
+**Debug vs release** (uncapped, 338x380→677x760, frag 2-pass): debug
+~144fps (6.9ms, GPU total 3.2ms) vs release ~151fps (6.6ms, GPU total
+3.1ms). Release explains ~0.3ms of the ~3.7ms CPU-side gap — debug
+overhead is not the story.
+
+**CPU section timers** (`--cpu-times`: scene submit / execute submit /
+blit+swap per frame) locate the rest: submit costs **~0.35ms total**
+(0.09 scene + 0.26 execute, release) while **present (swap) blocks
+6–11ms**. Audit of the submission path: no `glGetError` in the hot
+loop, no per-frame allocations, ~40 uncached `glGetUniformLocation`
+calls (µs-scale, noted as an optional micro-opt, not implemented — lost
+in present noise). Conclusion: the residual gap is compositor
+backpressure on `swap_buffers` under load, not actionable app code.
+
+**Size sweep** (release, uncapped, frag 2-pass; display fixed 677x760
+except the last row, which is niri-fullscreened 1366x768):
+
+| display px | scale | fps | convert | upscale | sharp | scene | total |
+| ---------- | ----- | --- | ------- | ------- | ----- | ----- | ----- |
+| 514k | 0.50 | ~129 | 0.37 | 1.90 | 0.93 | 0.40 | 3.2 |
+| 514k | 0.75 | ~131 | 0.81 | 1.98 | 0.90 | 0.93 | 3.7 |
+| 514k | 1.00 | ~110 | 1.38 | 2.15 | 0.90 | 1.60 | 4.4 |
+| 1049k | 0.50 | ~102 | 0.83 | 3.79 | 1.89 | 0.81 | 6.5 |
+
+Linearity confirmed (convert+scene scale with render px at ~3ns/px;
+upscale/sharp with display px at ~3.7/1.8ns/px — the 1366x768 row lands
+within 15% of the per-px projection). **Crossover: GPU total reaches a
+16.6ms vsync budget at ~1.4M display px at scale 1.0, ~2.7M px at scale
+0.5** — i.e. around 1080p-class the chain goes GPU-bound; upscale alone
+(3.7ns/px) would need ~4.5M px (near-4K) to fill vsync by itself. On
+this laptop's 1366x768 panel the chain stays GPU-comfortable: no shader
+optimization justified yet. If a bigger display ever makes upscale
+observable, start there — not before.
+
 Compute path on this driver is **not measurable per-pass**: the first timed
 query per frame reads ~6.5ms while activate/upscale read exactly 0.00,
 even given whole frames to themselves. The 6.5ms barely moves when render
@@ -163,7 +199,8 @@ Keys in the window: `V` cycle views, `M` motion, `H` luma-history,
 `R` history reset (camera-cut path), `F` compute/fragment toggle, `T`
 2/3-pass toggle, `G` gpu-times overlay.
 Headless flags: `--scale`, `--spin`, `--sharp`, `--view`, `--dump`,
-`--selftest`, `--debug-events`, `--force-fallback`, `--three-pass`.
+`--selftest`, `--debug-events`, `--cpu-times`, `--no-vsync`,
+`--force-fallback`, `--three-pass`.
 
 ## 8. Correction: the scene was scrambled until stage 8C (read this before
 trusting pre-8C temporal claims)

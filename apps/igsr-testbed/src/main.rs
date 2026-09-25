@@ -94,6 +94,7 @@ struct App {
     show_pre: bool,
     init_sharp: Option<f32>,
     no_vsync: bool,
+    cpu_times: bool,
     scale: f32,
     spin: f32,
     angle: f32,
@@ -135,6 +136,7 @@ impl App {
             show_pre: false,
             init_sharp: None,
             no_vsync,
+            cpu_times: false,
             scale: 0.5,
             spin: 0.5,
             angle: 0.0,
@@ -333,6 +335,12 @@ impl App {
         let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
         self.last_frame = std::time::Instant::now();
         self.angle += dt * self.spin;
+        // Stage-10 CPU section timers (gated by --cpu-times; Instant reads
+        // are ~20ns, negligible vs the ms-scale sections they bracket).
+        let mut t_cpu = std::time::Instant::now();
+        let ms_scene: f32;
+        let ms_exec: f32;
+        let ms_present: f32;
 
         let ctx = self.ctx.as_mut().unwrap();
         let pipe = self.pipeline.as_mut().unwrap();
@@ -379,6 +387,8 @@ impl App {
         if time_scene {
             unsafe { pipe.timer_end(gl, pipeline::PassId::Scene) };
         }
+        ms_scene = t_cpu.elapsed().as_secs_f32() * 1000.0;
+        t_cpu = std::time::Instant::now();
 
         // Frame uniforms: single source of truth via the C core.
         let reset = pipe.needs_reset;
@@ -395,6 +405,8 @@ impl App {
         };
         let params = ctx.frame_params(&inputs);
         let out_tex = unsafe { pipe.execute(gl, &params) };
+        ms_exec = t_cpu.elapsed().as_secs_f32() * 1000.0;
+        t_cpu = std::time::Instant::now();
         // Stage-6 views.
         let ww = size.width as i32;
         let wh = size.height as i32;
@@ -485,6 +497,7 @@ impl App {
         if let Err(e) = surface.swap_buffers(context) {
             eprintln!("[testbed] swap_buffers err: {e:?}");
         }
+        ms_present = t_cpu.elapsed().as_secs_f32() * 1000.0;
         self.frames += 1;
         if self.frames % 600 == 0 {
             let fps = self.frames as f32 / self.start.elapsed().as_secs_f32();
@@ -493,7 +506,12 @@ impl App {
             } else {
                 String::new()
             };
-            eprintln!("[testbed] ~{fps:.1} fps over {} frames ({}x{} -> {}x{}) {}", self.frames, rw, rh, dw, dh, gpu);
+            let cpu = if self.cpu_times {
+                format!(" cpu=[scene {ms_scene:.2}ms exec {ms_exec:.2}ms present {ms_present:.2}ms]")
+            } else {
+                String::new()
+            };
+            eprintln!("[testbed] ~{fps:.1} fps over {} frames ({}x{} -> {}x{}) {}{}", self.frames, rw, rh, dw, dh, gpu, cpu);
         }
     }
 
@@ -735,7 +753,9 @@ fn main() {
     let event_loop = EventLoop::new().expect("winit EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
     let no_vsync = has("--no-vsync");
+    let cpu_times = has("--cpu-times");
     let mut app = App::new(force_fallback, three_pass, selftest, dump_path, debug_events, no_vsync);
+    app.cpu_times = cpu_times;
     app.view = init_view;
     if let Some(sp) = args
         .iter()
