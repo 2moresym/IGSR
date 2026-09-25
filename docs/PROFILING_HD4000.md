@@ -28,14 +28,16 @@ commands here after any shader or pipeline change.
 per pass, results consumed 1–2 frames late, EMA overlay, `G` toggles the
 readout). Fragment path, 677x760 display:
 
-| render scale | convert | upscale | total |
-| ------------ | ------- | ------- | ----- |
-| 0.50 (338x380) | 0.39ms | 3.23ms | 3.58ms |
-| 0.75 (507x570) | 0.90ms | 3.57ms | 4.29ms |
-| 1.00 (677x760) | 1.60ms | 3.53ms | 5.02ms |
+| render scale | convert | upscale | sharp | total |
+| ------------ | ------- | ------- | ----- | ----- |
+| 0.50 (338x380) | 0.39ms | 3.23ms | 1.03ms | 4.41ms |
+| 0.75 (507x570) | 0.90ms | 3.57ms | — | 4.29ms* |
+| 1.00 (677x760) | 1.60ms | 3.53ms | — | 5.02ms* |
 
 Reads as: convert scales with render pixels (real work), upscale is flat
-(display-res work at fixed window size), totals self-sum. Trustworthy.
+(display-res work at fixed window size), sharpen is flat display-res
+5-tap work (~1ms at 677x760), totals self-sum. Trustworthy.
+(* pre-sharpen runs; sharp adds ~1ms on top at this display size.)
 
 Compute path on this driver is **not measurable per-pass**: the first timed
 query per frame reads ~6.5ms while activate/upscale read exactly 0.00,
@@ -114,17 +116,19 @@ Live keypresses cannot be automated on this box, verified twice:
 Permanent coverage instead (all green, all in-repo):
 
 - `cargo test -p igsr-testbed`: `handle_key` unit tests drive every
-  binding headless (view cycle, direct M/H, scale clamp 0.25–1.0,
-  R/F/T/G with and without a pipeline).
-- `--view <upscaled|native|split|motion|luma> --dump <file>`: exercises
+  binding headless (view cycle, direct M/H/C, scale clamp 0.25–1.0,
+  R/F/T/G/B/Z/X with and without a pipeline).
+- `--view <upscaled|native|split|motion|luma|clip> --dump <file>`: exercises
   every rendering branch behind the keybinds and produces diffable
   images (this is what caught the stage-6 velocity-clear and RG16F bugs).
+  `--dump` also writes the aligned pre-RCAS frame (`<file>_pre.ppm`).
 
 Keys in the window: `V` cycle views, `M` motion, `H` luma-history,
-`+`/`-` live scale, `R` history reset (camera-cut path), `F`
-compute/fragment toggle, `T` 2/3-pass toggle, `G` gpu-times overlay.
-Headless flags: `--scale`, `--view`, `--dump`, `--selftest`,
-`--debug-events`, `--force-fallback`, `--three-pass`.
+`C` clip/edge, `B` pre/post-RCAS, `Z`/`X` sharpness, `+`/`-` live scale,
+`R` history reset (camera-cut path), `F` compute/fragment toggle, `T`
+2/3-pass toggle, `G` gpu-times overlay.
+Headless flags: `--scale`, `--spin`, `--sharp`, `--view`, `--dump`,
+`--selftest`, `--debug-events`, `--force-fallback`, `--three-pass`.
 
 ## 8. Correction: the scene was scrambled until stage 8C (read this before
 trusting pre-8C temporal claims)

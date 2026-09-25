@@ -208,7 +208,6 @@ PrevLumaHistory ↔ LumaHistory **and** PrevHistory ↔ HistoryOutput.
    all doable procedurally in stage 5.
 
 ## 7. Stage 8C findings — motion handling re-read line by line
-
 Two questions, two answers.
 
 **Motion-vector dilation: checked, confirmed ABSENT.** All three converts
@@ -240,3 +239,41 @@ deltas self-attenuate. Verified with the new clip debug view (key `C`):
 combined clip fires green on true silhouettes, edge flag red on luma sign
 flips, both black in 2-pass mode. Fast-motion dumps (`--spin 5`) show no
 ghosting trails on the spinning cube or moon.
+
+## 8. Stage 9 — RCAS sharpen post-pass (new capability, not SGSR2)
+
+Sourcing, stated plainly: the project folder vendors
+`FidelityFX-FSR/ffx-fsr/ffx_fsr1.h`, and I read the RCAS algorithm there
+(`FsrRcasF`/`FsrRcasH`, lines ~600–870: 5-tap cross, luma×2 noise term,
+ring min/max, exact no-clip lobe solve with `FSR_RCAS_LIMIT =
+0.25−1/16`, normalized resolve) to understand it. The IGSR shaders
+(`sharpen.frag`/`.comp`) are our own implementation — own names,
+structure, comments, uniform layout, GLSL targets — not a line-by-line
+port, the same "read to understand" distinction kept throughout this
+project. The published header comments in that file describe the
+derivation and were used as the spec.
+
+Deliberate differences from the published shader:
+
+- No denoise term and no luma computation (published default leaves
+  `FSR_RCAS_DENOISE` off; with it off, luma feeds nothing — the lobe
+  solve is purely per-channel ring min/max). Grain-after-sharpen per
+  AMD's recommendation if grain ever lands.
+- Sharpness is a linear 0..1 multiplier on the solved lobe, not the
+  stops-based `2^-stops` constant setup. 0 gives exact passthrough
+  (lobe 0 → output = center tap, verified bit-close in --selftest).
+- Border taps clamp (edge replicate); the published callbacks leave
+  addressing to the caller.
+- Pure black/white neighborhoods divide 0/0 in the limiters exactly as
+  published; relies on the same fmax NaN tolerance, verified with
+  explicit black/white selftest pixels on crocus (black→black,
+  white→white).
+
+Plumbing: strict post-process after upscale on both paths (compute uses
+the prelude convention), reads the upscale output, writes a new
+display-res target. History keeps unsharpened pixels — sharpening
+history would feed amplified detail back into temporal accumulation.
+Default sharpness 0.3, keys `Z`/`X`, `B` toggles pre/post display,
+`--sharp`/`--spin`/`--dump` (dump also writes the aligned `_pre` frame).
+Verified: selftest edge gap 0.600 → 0.700 at sharp=1, and same-frame
+dump diffs localize exactly to silhouettes/edges (flat areas untouched).

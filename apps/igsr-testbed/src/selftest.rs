@@ -236,12 +236,13 @@ impl App {
             }
         };
 
-        // 7. Compute + activate probes (log only; exercised in stage 5).
+        // 7. Compute probes (log only). Sharpen included: same prelude rule.
         {
             let (maj, min) = self.gl_version;
             for (name, body) in [
                 ("upscale.comp", igsr_shaders::UPSCALE_COMP),
                 ("activate.comp", igsr_shaders::ACTIVATE_COMP),
+                ("sharpen.comp", igsr_shaders::SHARPEN_COMP),
             ] {
                 let mut done = false;
                 if let Some(pre) = gl_backend::compute_prelude(maj, min, self.compute_advertised) {
@@ -269,7 +270,7 @@ impl App {
         //    constant field is the constant).
         const DW: i32 = 96;
         const DH: i32 = 96;
-        let (color_tex, hist_tex, disp_fbo) = unsafe {
+        let (color_tex, hist_tex, disp_tex, disp_fbo) = unsafe {
             let color_tex = gl.create_texture().unwrap();
             gl.bind_texture(glow::TEXTURE_2D, Some(color_tex));
             gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
@@ -318,7 +319,7 @@ impl App {
                 fail.push("upscale FBO incomplete".into());
                 return Err(fail);
             }
-            (color_tex, hist_tex, disp_fbo)
+            (color_tex, hist_tex, disp_tex, disp_fbo)
         };
         unsafe {
             gl.viewport(0, 0, DW, DH);
@@ -395,9 +396,173 @@ impl App {
             return Err(fail);
         }
 
+        // 9. Sharpen fragment must compile (post-process, both paths use it
+        //    unless compute is available — see probe above).
+        let sharp_prog = match gl_backend::compile_program(
+            gl,
+            igsr_shaders::FULLSCREEN_VERT,
+            igsr_shaders::SHARPEN_FRAG,
+        ) {
+            Ok(p) => {
+                log.push("sharpen.frag compiles: ok".into());
+                p
+            }
+            Err(e) => {
+                fail.push(format!("sharpen.frag compile FAILED: {e}"));
+                return Err(fail);
+            }
+        };
+
+        // Helper: run sharpen.frag over `src` (DW x DH) at sharpness `sh`
+        // into a scratch RGBA16F target, read back pixel (rx, ry).
+        let run_sharp = |gl: &glow::Context,
+                         sharp_prog: glow::NativeProgram,
+                         vao: glow::NativeVertexArray,
+                         src: glow::NativeTexture,
+                         sh: f32,
+                         w: i32,
+                         h: i32,
+                         rx: i32,
+                         ry: i32,
+                         scratch_fbo: glow::NativeFramebuffer|
+         -> [f32; 4] {
+            unsafe {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(scratch_fbo));
+                gl.viewport(0, 0, w, h);
+                gl.use_program(Some(sharp_prog));
+                gl.active_texture(glow::TEXTURE0);
+                gl.bind_texture(glow::TEXTURE_2D, Some(src));
+                if let Some(l) = gl.get_uniform_location(sharp_prog, "u_image") {
+                    gl.uniform_1_i32(Some(&l), 0);
+                }
+                if let Some(l) = gl.get_uniform_location(sharp_prog, "u_display_size") {
+                    gl.uniform_2_f32(Some(&l), w as f32, h as f32);
+                }
+                if let Some(l) = gl.get_uniform_location(sharp_prog, "u_display_rcp") {
+                    gl.uniform_2_f32(Some(&l), 1.0 / w as f32, 1.0 / h as f32);
+                }
+                if let Some(l) = gl.get_uniform_location(sharp_prog, "u_sharp") {
+                    gl.uniform_1_f32(Some(&l), sh);
+                }
+                gl.bind_vertex_array(Some(vao));
+                gl.draw_arrays(glow::TRIANGLES, 0, 3);
+                gl.bind_vertex_array(None);
+                gl.use_program(None);
+                let mut px = [0u8; 16];
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(scratch_fbo));
+                gl.read_pixels(rx, ry, 1, 1, glow::RGBA, glow::FLOAT, glow::PixelPackData::Slice(Some(&mut px)));
+                gl.bind_framebuffer(glow::READ_FRAMEBUFFER, None);
+                [
+                    f32::from_le_bytes(px[0..4].try_into().unwrap()),
+                    f32::from_le_bytes(px[4..8].try_into().unwrap()),
+                    f32::from_le_bytes(px[8..12].try_into().unwrap()),
+                    f32::from_le_bytes(px[12..16].try_into().unwrap()),
+                ]
+            }
+        };
+
+        // Scratch target for sharpen runs.
+        let (scratch_tex, scratch_fbo) = unsafe {
+            let t = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA16F as i32, DW, DH, 0,
+                glow::RGBA, glow::HALF_FLOAT,
+                glow::PixelUnpackData::Slice(None),
+            );
+            let f = gl.create_framebuffer().unwrap();
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(t), 0);
+            assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE);
+            (t, f)
+        };
+        let _ = scratch_tex;
+
+        // 10. sharp=0 over the upscale output must reproduce it bit-closely
+        //     (passthrough: lobe 0 -> output = center tap, fp32-exact).
+        //     disp_tex holds the step-8 chain result; `c` is its center.
+        let s0 = run_sharp(gl, sharp_prog, vao, disp_tex, 0.0, DW, DH, DW / 2, DH / 2, scratch_fbo);
+        let same = (s0[0] - c[0]).abs() < 1e-6
+            && (s0[1] - c[1]).abs() < 1e-6
+            && (s0[2] - c[2]).abs() < 1e-6;
+        if same {
+            log.push(format!(
+                "sharpen(0) passthrough=({:.4}, {:.4}, {:.4}): ok",
+                s0[0], s0[1], s0[2]
+            ));
+        } else {
+            fail.push(format!("sharpen(0) passthrough=({s0:?}): expected ({c:?})"));
+            return Err(fail);
+        }
+
+        // 11b. The step field is DW x DH directly: vertical edge at
+        //     x = DW/2 (0.2 | 0.8 grey), black at (0,0), white at corner.
+        let step_tex = unsafe {
+            let t = gl.create_texture().unwrap();
+            gl.bind_texture(glow::TEXTURE_2D, Some(t));
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+            gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+            let mut px = vec![0u8; (DW * DH * 4) as usize];
+            for y in 0..DH {
+                for x in 0..DW {
+                    let i = ((y * DW + x) * 4) as usize;
+                    let g = if x < DW / 2 { 51u8 } else { 204u8 }; // 0.2 / 0.8
+                    px[i..i + 4].copy_from_slice(&[g, g, g, 255]);
+                }
+            }
+            px[0..4].copy_from_slice(&[0, 0, 0, 255]);
+            let last = (((DH - 1) * DW + (DW - 1)) * 4) as usize;
+            px[last..last + 4].copy_from_slice(&[255, 255, 255, 255]);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D, 0, glow::RGBA8 as i32, DW, DH, 0,
+                glow::RGBA, glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&px)),
+            );
+            t
+        };
+        let lx = DW / 2 - 1;
+        let rx = DW / 2;
+        let ey = DH / 2;
+        let pre_l = run_sharp(gl, sharp_prog, vao, step_tex, 0.0, DW, DH, lx, ey, scratch_fbo);
+        let pre_r = run_sharp(gl, sharp_prog, vao, step_tex, 0.0, DW, DH, rx, ey, scratch_fbo);
+        let post_l = run_sharp(gl, sharp_prog, vao, step_tex, 1.0, DW, DH, lx, ey, scratch_fbo);
+        let post_r = run_sharp(gl, sharp_prog, vao, step_tex, 1.0, DW, DH, rx, ey, scratch_fbo);
+        let pre_gap = (pre_r[0] - pre_l[0]).abs();
+        let post_gap = (post_r[0] - post_l[0]).abs();
+        // sharp=0 reproduces the step exactly (sanity on the harness).
+        let step_ok = (pre_l[0] - 0.2).abs() < 0.01 && (pre_r[0] - 0.8).abs() < 0.01;
+        // sharp=1 must widen the edge: dark side darker, bright side brighter.
+        let boost_ok = post_gap > pre_gap + 0.02 && post_l[0] < pre_l[0] && post_r[0] > pre_r[0];
+        if step_ok && boost_ok {
+            log.push(format!(
+                "sharpen(1) edge gap {pre_gap:.3} -> {post_gap:.3}: ok"
+            ));
+        } else {
+            fail.push(format!(
+                "sharpen edge: pre=({pre_l:?},{pre_r:?}) post=({post_l:?},{post_r:?})"
+            ));
+            return Err(fail);
+        }
+        // 11c. Pure black / pure white survive (0/0 limiter NaN tolerance).
+        let blk = run_sharp(gl, sharp_prog, vao, step_tex, 1.0, DW, DH, 0, 0, scratch_fbo);
+        let wht = run_sharp(gl, sharp_prog, vao, step_tex, 1.0, DW, DH, DW - 1, DH - 1, scratch_fbo);
+        if blk[0].abs() < 1e-3 && blk[1].abs() < 1e-3 && blk[2].abs() < 1e-3
+            && (wht[0] - 1.0).abs() < 1e-3 && (wht[1] - 1.0).abs() < 1e-3 && (wht[2] - 1.0).abs() < 1e-3
+        {
+            log.push("sharpen(1) black->black white->white: ok".into());
+        } else {
+            fail.push(format!("sharpen extremes: black={blk:?} white={wht:?}"));
+            return Err(fail);
+        }
+
         unsafe {
             gl.delete_program(prog);
             gl.delete_program(uprog);
+            gl.delete_program(sharp_prog);
         }
         let _ = (out_tex, self.force_fallback);
         if fail.is_empty() { Ok(log) } else { Err(fail) }

@@ -91,6 +91,8 @@ struct App {
     view: ViewMode,
     debug_events: bool,
     show_gpu: bool,
+    show_pre: bool,
+    init_sharp: Option<f32>,
     scale: f32,
     spin: f32,
     angle: f32,
@@ -128,6 +130,8 @@ impl App {
             view: ViewMode::Upscaled,
             debug_events,
             show_gpu: true,
+            show_pre: false,
+            init_sharp: None,
             scale: 0.5,
             spin: 0.5,
             angle: 0.0,
@@ -255,7 +259,7 @@ impl App {
         let cfg = igsr::IgsrConfig::new(rw, rh, dw, dh);
         let ictx = igsr::IgsrContext::new(cfg).expect("IgsrContext::new");
         let (maj, min) = self.gl_version;
-        let pipe = unsafe {
+        let mut pipe = unsafe {
             pipeline::Pipeline::new(
                 &gl,
                 maj,
@@ -280,12 +284,15 @@ impl App {
             pipe.use_compute,
             self.three_pass && pipe.use_compute,
         );
-        eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | C clip/edge | +/- scale | R reset | F compute/frag | T 2/3-pass | G gpu times");
+        eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | C clip/edge | B pre/post-RCAS | Z/X sharpness | +/- scale | R reset | F compute/frag | T 2/3-pass | G gpu times");
         eprintln!(
             "[testbed] timer queries: {}",
             if pipe.timers_supported() { "supported" } else { "UNSUPPORTED (overlay shows placeholder)" }
         );
         self.backend_compute = backend.supports_compute();
+        if let Some(sh) = self.init_sharp {
+            pipe.sharpness = sh;
+        }
 
         self.window = Some(window);
         self.config = Some(config);
@@ -377,7 +384,10 @@ impl App {
         let wh = size.height as i32;
         unsafe {
             match self.view {
-                ViewMode::Upscaled => pipe.blit_to_screen(gl, out_tex, ww, wh),
+                ViewMode::Upscaled => {
+                    let tex = if self.show_pre { pipe.pre_sharpen_tex() } else { out_tex };
+                    pipe.blit_to_screen(gl, tex, ww, wh)
+                }
                 ViewMode::Native => {
                     pipe.blit_to_screen(gl, pipe.scene_color_tex(), ww, wh)
                 }
@@ -431,6 +441,27 @@ impl App {
                     }
                     std::fs::write(&path, &ppm).expect("dump write");
                     eprintln!("[testbed] dumped frame {} to {path}", self.frames);
+                    // Aligned before/after pair: blit the pre-RCAS frame and
+                    // dump it alongside, so sharpening is comparable without
+                    // a second run (angle would differ).
+                    let pre_path = path.replace(".ppm", "_pre.ppm");
+                    pipe.blit_to_screen(gl, pipe.pre_sharpen_tex(), w, h);
+                    let mut px2 = vec![0u8; (w * h * 4) as usize];
+                    gl.read_pixels(
+                        0, 0, w, h,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelPackData::Slice(Some(&mut px2)),
+                    );
+                    let mut ppm2 = format!("P6\n{w} {h}\n255\n").into_bytes();
+                    for y in (0..h).rev() {
+                        for x in 0..w {
+                            let i = ((y * w + x) * 4) as usize;
+                            ppm2.extend_from_slice(&px2[i..i + 3]);
+                        }
+                    }
+                    std::fs::write(&pre_path, &ppm2).expect("dump write");
+                    eprintln!("[testbed] dumped pre-RCAS frame to {pre_path}");
                 }
             }
         }
@@ -469,9 +500,11 @@ impl App {
             String::new()
         };
         eprintln!(
-            "[testbed] view={} scale={:.2} ({}x{}->{}x{}) path={} passes={} {}",
+            "[testbed] view={} scale={:.2} sharp={:.2}{} ({}x{}->{}x{}) path={} passes={} {}",
             self.view.name(),
             self.scale,
+            self.pipeline.as_ref().map(|p| p.sharpness).unwrap_or(0.0),
+            if self.show_pre { " pre" } else { "" },
             rw,
             rh,
             dw,
@@ -542,6 +575,25 @@ impl App {
             }
             KeyCode::KeyG => {
                 self.show_gpu = !self.show_gpu;
+                self.print_status();
+            }
+            KeyCode::KeyB => {
+                self.show_pre = !self.show_pre;
+                eprintln!(
+                    "[testbed] showing {}",
+                    if self.show_pre { "pre-RCAS" } else { "post-RCAS" }
+                );
+            }
+            KeyCode::KeyZ => {
+                if let Some(p) = self.pipeline.as_mut() {
+                    p.sharpness = (p.sharpness - 0.1).max(0.0);
+                }
+                self.print_status();
+            }
+            KeyCode::KeyX => {
+                if let Some(p) = self.pipeline.as_mut() {
+                    p.sharpness = (p.sharpness + 0.1).min(1.0);
+                }
                 self.print_status();
             }
             _ => {}
@@ -676,6 +728,14 @@ fn main() {
     {
         app.spin = sp;
     }
+    if let Some(sh) = args
+        .iter()
+        .position(|a| a == "--sharp")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        app.init_sharp = Some(sh.clamp(0.0, 1.0));
+    }
     if let Some(s) = args
         .iter()
         .position(|a| a == "--scale")
@@ -755,6 +815,11 @@ mod tests {
         assert!(!a.show_gpu);
         a.handle_key(KeyCode::KeyG);
         assert!(a.show_gpu);
+        a.handle_key(KeyCode::KeyB);
+        assert!(a.show_pre);
+        a.handle_key(KeyCode::KeyX);
+        a.handle_key(KeyCode::KeyX);
+        a.handle_key(KeyCode::KeyZ);
         a.handle_key(KeyCode::KeyX); // unbound: no-op
         assert_eq!(a.same_camera, 0);
     }

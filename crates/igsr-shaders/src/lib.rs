@@ -20,4 +20,8 @@ pub const CONVERT_COMP: &str = include_str!("../shaders/convert.comp");
 pub const UPSCALE_FRAG: &str = include_str!("../shaders/upscale.frag");
 pub const UPSCALE_COMP: &str = include_str!("../shaders/upscale.comp");
 pub const ACTIVATE_COMP: &str = include_str!("../shaders/activate.comp");
+// Stage 9: sharpen post-pass (own RCAS implementation). Fragment writes one
+// RGB target; compute uses the prelude convention (no `#version` line).
+pub const SHARPEN_FRAG: &str = include_str!("../shaders/sharpen.frag");
+pub const SHARPEN_COMP: &str = include_str!("../shaders/sharpen.comp");
 pub const FULLSCREEN_VERT: &str = include_str!("../shaders/fullscreen.vert");

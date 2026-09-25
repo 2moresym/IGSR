@@ -76,9 +76,10 @@ pub enum PassId {
     Activate = 1,
     Upscale = 2,
     Total = 3,
+    Sharp = 4,
 }
 
-const N_TIMED: usize = 4;
+const N_TIMED: usize = 5;
 
 /// GL_ARB_timer_query instrumentation with 3 in-flight slots per pass, so
 /// results are consumed 1–2 frames late and never stall the pipeline.
@@ -206,6 +207,7 @@ impl PassTimers {
             self.ema(PassId::Activate),
             self.ema(PassId::Upscale),
             self.ema(PassId::Total),
+            self.ema(PassId::Sharp),
         )
     }
 }
@@ -217,6 +219,7 @@ fn format_report(
     activate_ms: Option<f32>,
     upscale_ms: Option<f32>,
     total_ms: Option<f32>,
+    sharp_ms: Option<f32>,
 ) -> String {
     if !supported {
         return "gpu=[timer queries unsupported]".into();
@@ -227,6 +230,7 @@ fn format_report(
         s.push_str(&format!("activate {} ", fmt_ms(activate_ms)));
     }
     s.push_str(&format!("upscale {} ", fmt_ms(upscale_ms)));
+    s.push_str(&format!("sharp {} ", fmt_ms(sharp_ms)));
     s.push_str(&format!("total {}]", fmt_ms(total_ms)));
     s
 }
@@ -245,16 +249,16 @@ mod timer_tests {
     #[test]
     fn report_formats() {
         assert_eq!(
-            format_report(false, None, None, None, None),
+            format_report(false, None, None, None, None, None),
             "gpu=[timer queries unsupported]"
         );
         assert_eq!(
-            format_report(true, Some(0.424), None, Some(1.096), Some(1.62)),
-            "gpu=[convert 0.42ms upscale 1.10ms total 1.62ms]"
+            format_report(true, Some(0.424), None, Some(1.096), Some(1.62), Some(0.31)),
+            "gpu=[convert 0.42ms upscale 1.10ms sharp 0.31ms total 1.62ms]"
         );
         assert_eq!(
-            format_report(true, Some(0.424), Some(0.1), None, None),
-            "gpu=[convert 0.42ms activate 0.10ms upscale -- total --]"
+            format_report(true, Some(0.424), Some(0.1), None, None, None),
+            "gpu=[convert 0.42ms activate 0.10ms upscale -- sharp -- total --]"
         );
     }
 }
@@ -313,6 +317,14 @@ pub struct Pipeline {
     scene_out_tex: glow::NativeTexture,
     timers: PassTimers,
     timer_frame: u64,
+    // Sharpen post-pass (stage 9): strict post-process on the upscale
+    // output. History keeps the UNSHARPENED frame (sharpening history
+    // would feed amplified detail back into temporal accumulation).
+    sharp_fbo: glow::NativeFramebuffer,
+    sharp_tex: glow::NativeTexture,
+    sharpen_frag: glow::NativeProgram,
+    sharpen_comp: Option<glow::NativeProgram>,
+    pub sharpness: f32,
     // Programs.
     convert_frag: glow::NativeProgram,
     upscale_frag: glow::NativeProgram,
@@ -353,6 +365,8 @@ impl Pipeline {
                 gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, LUMA_FRAG)?;
             let clip_prog =
                 gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, CLIP_FRAG)?;
+            let sharpen_frag =
+                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, igsr_shaders::SHARPEN_FRAG)?;
 
             // Compute programs (prelude + body). Any failure → fragment path.
             let prelude = gl_backend::compute_prelude(gl_major, gl_minor, backend_compute);
@@ -360,6 +374,7 @@ impl Pipeline {
             let mut convert_comp = None;
             let mut upscale_comp = None;
             let mut activate_comp = None;
+            let mut sharpen_comp = None;
             if let Some(pre) = prelude {
                 let cc = |body: &str| {
                     let src = format!("{pre}{body}");
@@ -368,6 +383,7 @@ impl Pipeline {
                 convert_comp = cc(igsr_shaders::CONVERT_COMP);
                 upscale_comp = cc(igsr_shaders::UPSCALE_COMP);
                 activate_comp = cc(igsr_shaders::ACTIVATE_COMP);
+                sharpen_comp = cc(igsr_shaders::SHARPEN_COMP);
                 if convert_comp.is_none() || upscale_comp.is_none() {
                     eprintln!("[pipeline] compute compile failed; using fragment path");
                     use_compute = false;
@@ -425,6 +441,11 @@ impl Pipeline {
                 convert_comp,
                 upscale_comp,
                 activate_comp,
+                sharp_fbo: gl.create_framebuffer().unwrap(),
+                sharp_tex: gl.create_texture().unwrap(),
+                sharpen_frag,
+                sharpen_comp,
+                sharpness: 0.3,
                 blit_vao,
                 _blit_vbo: blit_vbo,
             };
@@ -441,6 +462,7 @@ impl Pipeline {
             for t in [
                 self.scene_color, self.scene_vel, self.scene_depth,
                 self.data_tex, self.data2_tex, self.scene_out_tex,
+                self.sharp_tex,
                 self.luma_tex[0], self.luma_tex[1],
                 self.hist_tex[0], self.hist_tex[1],
             ] {
@@ -496,6 +518,13 @@ impl Pipeline {
                 gl.clear_color(0.0, 0.0, 0.0, 0.0);
                 gl.clear(glow::COLOR_BUFFER_BIT);
             }
+            // Sharpen target (display res). No history role — never cleared
+            // for blending; every frame overwrites it fully.
+            self.sharp_tex = tex2d(gl, glow::RGBA16F as i32, dw, dh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::NEAREST);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.sharp_fbo));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.sharp_tex), 0);
+            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+            assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE);
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.luma_read = 0;
             self.hist_read = 0;
@@ -580,6 +609,25 @@ impl Pipeline {
         }
     }
 
+    fn set_sharpen_uniforms(
+        gl: &glow::Context,
+        prog: glow::NativeProgram,
+        p: &IgsrParamsFfi,
+        sharpness: f32,
+    ) {
+        unsafe {
+            if let Some(l) = Self::uni(gl, prog, "u_display_size") {
+                gl.uniform_2_f32(Some(&l), p.display_size[0], p.display_size[1]);
+            }
+            if let Some(l) = Self::uni(gl, prog, "u_display_rcp") {
+                gl.uniform_2_f32(Some(&l), p.display_size_rcp[0], p.display_size_rcp[1]);
+            }
+            if let Some(l) = Self::uni(gl, prog, "u_sharp") {
+                gl.uniform_1_f32(Some(&l), sharpness.clamp(0.0, 1.0));
+            }
+        }
+    }
+
     fn bind_tex(gl: &glow::Context, unit: u32, tex: glow::NativeTexture) {
         unsafe {
             gl.active_texture(glow::TEXTURE0 + unit);
@@ -613,12 +661,13 @@ impl Pipeline {
             // on crocus (nested queries starve the inner ones); giving each
             // query a whole frame keeps every reading trustworthy.
             // EMA converges ~4x slower — acceptable for an overlay number.
-            const ALL: u8 = 0b1111;
-            self.timers.mask = match self.timer_frame % 4 {
+            const ALL: u8 = 0b11111;
+            self.timers.mask = match self.timer_frame % 5 {
                 0 => ALL & !(1 << PassId::Convert as u8),
                 1 => ALL & !(1 << PassId::Upscale as u8),
                 2 => ALL & !(1 << PassId::Activate as u8),
-                _ => ALL & !(1 << PassId::Total as u8),
+                3 => ALL & !(1 << PassId::Total as u8),
+                _ => ALL & !(1 << PassId::Sharp as u8),
             };
             self.timer_frame += 1;
             self.timers.begin(gl, PassId::Total);
@@ -750,9 +799,50 @@ impl Pipeline {
             self.hist_read = hw;
             self.needs_reset = false;
             self.last_data = Some(data_for_upscale);
+
+            // ---- Sharpen (stage 9, strict post-process) ----
+            // Reads the upscale output, writes the new final frame. History
+            // keeps the unsharpened pixels by design (see struct docs).
+            let pre = self.hist_tex[self.hist_read];
+            let use_cs = self.use_compute && self.sharpen_comp.is_some();
+            if use_cs {
+                let prog = self.sharpen_comp.unwrap();
+                self.timers.begin(gl, PassId::Sharp);
+                gl.use_program(Some(prog));
+                Self::bind_tex(gl, 0, pre);
+                if let Some(l) = Self::uni(gl, prog, "u_image") {
+                    gl.uniform_1_i32(Some(&l), 0);
+                }
+                Self::set_sharpen_uniforms(gl, prog, p, self.sharpness);
+                gl.bind_image_texture(0, Some(self.sharp_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
+                gl.dispatch_compute(dx, dy, 1);
+                Self::barrier(gl);
+                self.timers.end(gl, PassId::Sharp);
+                gl.use_program(None);
+            } else {
+                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.sharp_fbo));
+                gl.viewport(0, 0, self.dw as i32, self.dh as i32);
+                self.timers.begin(gl, PassId::Sharp);
+                gl.use_program(Some(self.sharpen_frag));
+                Self::bind_tex(gl, 0, pre);
+                if let Some(l) = Self::uni(gl, self.sharpen_frag, "u_image") {
+                    gl.uniform_1_i32(Some(&l), 0);
+                }
+                Self::set_sharpen_uniforms(gl, self.sharpen_frag, p, self.sharpness);
+                Self::draw_full(gl, self.blit_vao);
+                self.timers.end(gl, PassId::Sharp);
+                gl.use_program(None);
+            }
+
             self.timers.end(gl, PassId::Total);
-            self.hist_tex[self.hist_read]
+            self.sharp_tex
         }
+    }
+
+    /// The upscale output BEFORE sharpening (for the B before/after toggle).
+    /// Valid after execute(); history-identical (sharpen never feeds back).
+    pub fn pre_sharpen_tex(&self) -> glow::NativeTexture {
+        self.hist_tex[self.hist_read]
     }
 
     /// Blit a display-res texture to the window.
