@@ -93,6 +93,7 @@ struct App {
     show_gpu: bool,
     show_pre: bool,
     init_sharp: Option<f32>,
+    no_vsync: bool,
     scale: f32,
     spin: f32,
     angle: f32,
@@ -109,6 +110,7 @@ impl App {
         selftest: bool,
         dump_path: Option<String>,
         debug_events: bool,
+        no_vsync: bool,
     ) -> Self {        let now = std::time::Instant::now();
         Self {
             force_fallback,
@@ -132,6 +134,7 @@ impl App {
             show_gpu: true,
             show_pre: false,
             init_sharp: None,
+            no_vsync,
             scale: 0.5,
             spin: 0.5,
             angle: 0.0,
@@ -203,11 +206,15 @@ impl App {
                 .expect("create window surface failed")
         };
         let context = not_current.make_current(&surface).expect("make_current failed");
-        if let Err(e) = surface.set_swap_interval(
-            &context,
-            SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
-        ) {
+        let swap = if self.no_vsync {
+            SwapInterval::DontWait
+        } else {
+            SwapInterval::Wait(NonZeroU32::new(1).unwrap())
+        };
+        if let Err(e) = surface.set_swap_interval(&context, swap) {
             eprintln!("[testbed] swap interval err (non-fatal): {e:?}");
+        } else {
+            eprintln!("[testbed] vsync {}", if self.no_vsync { "OFF" } else { "on" });
         }
 
         // Load GL via glow.
@@ -349,6 +356,12 @@ impl App {
         mat4::apply_jitter(&mut proj, jitter[0], jitter[1], rw as f32, rh as f32);
 
         // Scene pass at render res (color + velocity + linear depth).
+        // Timed under the rotating scheme when its slot is armed; like the
+        // other passes this never blocks (results harvested in execute).
+        let time_scene = pipe.timer_armed(pipeline::PassId::Scene);
+        if time_scene {
+            unsafe { pipe.timer_begin(gl, pipeline::PassId::Scene) };
+        }
         let (vp, vp_prev) = unsafe {
             gl.bind_framebuffer(glow::FRAMEBUFFER, Some(pipe.scene_fbo()));
             gl.viewport(0, 0, rw as i32, rh as i32);
@@ -363,6 +376,9 @@ impl App {
             gl.clear_buffer_f32_slice(glow::COLOR, 2, &[1.0, 0.0, 0.0, 0.0]);
             scn.render(gl, self.angle, &view, &proj, far)
         };
+        if time_scene {
+            unsafe { pipe.timer_end(gl, pipeline::PassId::Scene) };
+        }
 
         // Frame uniforms: single source of truth via the C core.
         let reset = pipe.needs_reset;
@@ -718,7 +734,8 @@ fn main() {
     // ---- Open window ----
     let event_loop = EventLoop::new().expect("winit EventLoop::new");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::new(force_fallback, three_pass, selftest, dump_path, debug_events);
+    let no_vsync = has("--no-vsync");
+    let mut app = App::new(force_fallback, three_pass, selftest, dump_path, debug_events, no_vsync);
     app.view = init_view;
     if let Some(sp) = args
         .iter()
@@ -752,7 +769,7 @@ mod tests {
     use super::*;
 
     fn headless_app() -> App {
-        App::new(false, false, false, None, false)
+        App::new(false, false, false, None, false, false)
     }
 
     #[test]

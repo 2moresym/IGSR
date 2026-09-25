@@ -26,18 +26,53 @@ commands here after any shader or pipeline change.
 `GL_ARB_timer_query` **is supported** on crocus 4.2. Each pass is wrapped in
 `TIME_ELAPSED` queries (`PassTimers` in `pipeline.rs`: 3 in-flight slots
 per pass, results consumed 1–2 frames late, EMA overlay, `G` toggles the
-readout). Fragment path, 677x760 display:
+readout). The report always lists activate explicitly (`--` when the
+2-pass chain never runs it) so a missing pass can't hide. The scene pass
+is timed too (added stage 10 — it lives outside `execute`). Fragment path,
+677x760 display:
 
-| render scale | convert | upscale | sharp | total |
-| ------------ | ------- | ------- | ----- | ----- |
-| 0.50 (338x380) | 0.39ms | 3.23ms | 1.03ms | 4.41ms |
-| 0.75 (507x570) | 0.90ms | 3.57ms | — | 4.29ms* |
-| 1.00 (677x760) | 1.60ms | 3.53ms | — | 5.02ms* |
+| render scale | convert | upscale | sharp | scene | total |
+| ------------ | ------- | ------- | ----- | ----- | ----- |
+| 0.50 (338x380) | 0.39ms | 3.23ms | 1.03ms | — | 4.41ms |
+| 0.75 (507x570) | 0.90ms | 3.57ms | — | — | 4.29ms* |
+| 1.00 (677x760) | 1.60ms | 3.53ms | — | — | 5.02ms* |
 
 Reads as: convert scales with render pixels (real work), upscale is flat
 (display-res work at fixed window size), sharpen is flat display-res
 5-tap work (~1ms at 677x760), totals self-sum. Trustworthy.
 (* pre-sharpen runs; sharp adds ~1ms on top at this display size.)
+
+### Stage 10 baseline: the 8x gap explained (no upscale work needed yet)
+
+A capped run once showed 27fps (36.8ms/frame) against 4.41ms of timers —
+an 8x gap that demanded an explanation before any optimization. Clean
+baselines (no `--view`/`--dump`, steady-state last lines, all passes
+listed):
+
+- frag 2-pass capped: ~50fps (20ms), timers total ~4.6ms.
+- compute 2-pass capped: ~57fps (17.5ms), timers total ~6.8ms.
+- frag 2-pass **uncapped** (`--no-vsync`): **~144fps (6.9ms)** with
+  convert 0.37 / upscale **1.90** / sharp 0.93 / scene 0.40 / total 3.16.
+
+Decomposition of the original gap:
+
+1. **Vsync/compositor capping is the bulk.** Uncapped, the whole frame is
+   ~7ms; capped runs sit at 17–22ms. The 27fps number was a loaded
+   outlier (browser video + cold start), not representative — later
+   capped runs of the same config show ~50fps.
+2. **The scene pass was untimed** (0.40ms — small, but it was invisible).
+3. **~3.7ms/frame is CPU-side** (debug build, ~100 small GL calls/frame
+   for uniforms/binds/FBO switches, event loop, swap) — the remainder
+   after vsync, measured as uncapped frame (6.9ms) minus GPU total
+   (3.2ms).
+4. Timer values shift under vsync backpressure (upscale reads 3.3ms
+   capped vs 1.9ms uncapped) — quote uncapped numbers for pass costs.
+
+Upscale's true cost is ~1.9/6.9ms ≈ 28% of the uncapped frame — the
+biggest single pass, but with the loop vsync-capped at ~59fps in
+practice, shader-level upscale work buys nothing observable at this
+window size. Optimization (step 4) should target bigger windows/scales
+first, or the CPU-side submission cost — not upscale's shader code yet.
 
 Compute path on this driver is **not measurable per-pass**: the first timed
 query per frame reads ~6.5ms while activate/upscale read exactly 0.00,

@@ -77,9 +77,10 @@ pub enum PassId {
     Upscale = 2,
     Total = 3,
     Sharp = 4,
+    Scene = 5,
 }
 
-const N_TIMED: usize = 5;
+const N_TIMED: usize = 6;
 
 /// GL_ARB_timer_query instrumentation with 3 in-flight slots per pass, so
 /// results are consumed 1–2 frames late and never stall the pipeline.
@@ -197,7 +198,7 @@ impl PassTimers {
         v.then_some(self.ema_ms[pass as usize])
     }
 
-    /// One-line overlay fragment, e.g. `gpu=[convert 0.42ms upscale 1.10ms
+    /// One-line overlay fragment, e.g. `gpu=[convert 0.42ms activate -- upscale 1.10ms
     /// total 1.60ms]`. Activate is shown only once it has produced a sample
     /// (3-pass runs).
     pub fn report(&self) -> String {
@@ -208,7 +209,19 @@ impl PassTimers {
             self.ema(PassId::Upscale),
             self.ema(PassId::Total),
             self.ema(PassId::Sharp),
+            self.ema(PassId::Scene),
         )
+    }
+
+    /// Whether `pass` owns this frame's query slot (rotation scheme).
+    pub fn timer_armed(&self, pass: PassId) -> bool {
+        self.supported && (self.mask & (1 << pass as u8)) == 0
+    }
+    pub unsafe fn timer_begin(&mut self, gl: &glow::Context, pass: PassId) {
+        unsafe { self.begin(gl, pass) }
+    }
+    pub unsafe fn timer_end(&self, gl: &glow::Context, pass: PassId) {
+        unsafe { self.end(gl, pass) }
     }
 }
 
@@ -220,17 +233,19 @@ fn format_report(
     upscale_ms: Option<f32>,
     total_ms: Option<f32>,
     sharp_ms: Option<f32>,
+    scene_ms: Option<f32>,
 ) -> String {
     if !supported {
         return "gpu=[timer queries unsupported]".into();
     }
     let mut s = String::from("gpu=[");
     s.push_str(&format!("convert {} ", fmt_ms(convert_ms)));
-    if activate_ms.is_some() {
-        s.push_str(&format!("activate {} ", fmt_ms(activate_ms)));
-    }
+    // Always shown (2-pass runs read `--`): an absent activate must be
+    // visibly absent, not silently missing (stage 10 step 1).
+    s.push_str(&format!("activate {} ", fmt_ms(activate_ms)));
     s.push_str(&format!("upscale {} ", fmt_ms(upscale_ms)));
     s.push_str(&format!("sharp {} ", fmt_ms(sharp_ms)));
+    s.push_str(&format!("scene {} ", fmt_ms(scene_ms)));
     s.push_str(&format!("total {}]", fmt_ms(total_ms)));
     s
 }
@@ -249,16 +264,16 @@ mod timer_tests {
     #[test]
     fn report_formats() {
         assert_eq!(
-            format_report(false, None, None, None, None, None),
+            format_report(false, None, None, None, None, None, None),
             "gpu=[timer queries unsupported]"
         );
         assert_eq!(
-            format_report(true, Some(0.424), None, Some(1.096), Some(1.62), Some(0.31)),
-            "gpu=[convert 0.42ms upscale 1.10ms sharp 0.31ms total 1.62ms]"
+            format_report(true, Some(0.424), None, Some(1.096), Some(1.62), Some(0.31), Some(0.5)),
+            "gpu=[convert 0.42ms activate -- upscale 1.10ms sharp 0.31ms scene 0.50ms total 1.62ms]"
         );
         assert_eq!(
-            format_report(true, Some(0.424), Some(0.1), None, None, None),
-            "gpu=[convert 0.42ms activate 0.10ms upscale -- sharp -- total --]"
+            format_report(true, Some(0.424), Some(0.1), None, None, None, None),
+            "gpu=[convert 0.42ms activate 0.10ms upscale -- sharp -- scene -- total --]"
         );
     }
 }
@@ -661,13 +676,14 @@ impl Pipeline {
             // on crocus (nested queries starve the inner ones); giving each
             // query a whole frame keeps every reading trustworthy.
             // EMA converges ~4x slower — acceptable for an overlay number.
-            const ALL: u8 = 0b11111;
-            self.timers.mask = match self.timer_frame % 5 {
+            const ALL: u8 = 0b111111;
+            self.timers.mask = match self.timer_frame % 6 {
                 0 => ALL & !(1 << PassId::Convert as u8),
                 1 => ALL & !(1 << PassId::Upscale as u8),
                 2 => ALL & !(1 << PassId::Activate as u8),
                 3 => ALL & !(1 << PassId::Total as u8),
-                _ => ALL & !(1 << PassId::Sharp as u8),
+                4 => ALL & !(1 << PassId::Sharp as u8),
+                _ => ALL & !(1 << PassId::Scene as u8),
             };
             self.timer_frame += 1;
             self.timers.begin(gl, PassId::Total);
@@ -919,6 +935,17 @@ impl Pipeline {
     /// Current per-pass GPU timings overlay fragment (stage 8A).
     pub fn timers_report(&self) -> String {
         self.timers.report()
+    }
+    /// Scene pass lives outside execute; main wraps it via these when its
+    /// rotation slot is armed (stage 10).
+    pub fn timer_armed(&self, pass: PassId) -> bool {
+        self.timers.timer_armed(pass)
+    }
+    pub unsafe fn timer_begin(&mut self, gl: &glow::Context, pass: PassId) {
+        unsafe { self.timers.timer_begin(gl, pass) }
+    }
+    pub unsafe fn timer_end(&self, gl: &glow::Context, pass: PassId) {
+        unsafe { self.timers.timer_end(gl, pass) }
     }
     pub fn timers_supported(&self) -> bool {
         self.timers.supported()
