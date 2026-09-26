@@ -7,6 +7,7 @@
 //! no Vireo/Lake, no external assets.
 
 mod mat4;
+mod passes;
 mod pipeline;
 mod scene;
 mod selftest;
@@ -95,6 +96,7 @@ struct App {
     init_sharp: Option<f32>,
     no_vsync: bool,
     cpu_times: bool,
+    fixed_dt: Option<f32>,
     scale: f32,
     spin: f32,
     angle: f32,
@@ -137,6 +139,7 @@ impl App {
             init_sharp: None,
             no_vsync,
             cpu_times: false,
+            fixed_dt: None,
             scale: 0.5,
             spin: 0.5,
             angle: 0.0,
@@ -290,8 +293,8 @@ impl App {
             rh,
             dw,
             dh,
-            pipe.use_compute,
-            self.three_pass && pipe.use_compute,
+            pipe.use_compute(),
+            self.three_pass && pipe.use_compute(),
         );
         eprintln!("[testbed] keys: V cycle view | M motion | H luma-history | C clip/edge | B pre/post-RCAS | Z/X sharpness | +/- scale | R reset | F compute/frag | T 2/3-pass | G gpu times");
         eprintln!(
@@ -300,7 +303,7 @@ impl App {
         );
         self.backend_compute = backend.supports_compute();
         if let Some(sh) = self.init_sharp {
-            pipe.sharpness = sh;
+            pipe.set_sharpness(sh);
         }
 
         self.window = Some(window);
@@ -332,7 +335,13 @@ impl App {
         let rw = ((dw as f32 * self.scale) as u32).max(8);
         let rh = ((dh as f32 * self.scale) as u32).max(8);
 
-        let dt = self.last_frame.elapsed().as_secs_f32().min(0.1);
+        // `--fixed-dt` replaces wall-clock dt with a constant so animated
+        // captures are bit-reproducible across runs (stage 11 regression
+        // bar: deterministic *animated* baselines, not just static ones).
+        let dt = match self.fixed_dt {
+            Some(v) => v,
+            None => self.last_frame.elapsed().as_secs_f32().min(0.1),
+        };
         self.last_frame = std::time::Instant::now();
         self.angle += dt * self.spin;
         // Stage-10 CPU section timers (gated by --cpu-times; Instant reads
@@ -362,6 +371,10 @@ impl App {
         let view = mat4::look_at([0.0, 1.2, 4.5], [0.0, 0.3, 0.0], [0.0, 1.0, 0.0]);
         let mut proj = mat4::perspective(fov_v, aspect, near, far);
         mat4::apply_jitter(&mut proj, jitter[0], jitter[1], rw as f32, rh as f32);
+
+        // Rotate the timer query slots for this frame (one active query
+        // per frame — nested queries mis-report on crocus).
+        pipe.begin_frame();
 
         // Scene pass at render res (color + velocity + linear depth).
         // Timed under the rotating scheme when its slot is armed; like the
@@ -404,16 +417,29 @@ impl App {
             reset,
         };
         let params = ctx.frame_params(&inputs);
-        let out_tex = unsafe { pipe.execute(gl, &params) };
+        let out_tex = unsafe { pipe.run(gl, &params) };
         ms_exec = t_cpu.elapsed().as_secs_f32() * 1000.0;
         t_cpu = std::time::Instant::now();
-        // Stage-6 views.
+        // Stage-6 views. Pass-offered debug views (motion/luma/clip) resolve
+        // by label through the pipeline's view list — a new pass that
+        // offers a view needs no change here.
         let ww = size.width as i32;
         let wh = size.height as i32;
         unsafe {
+            let blit_view = |label: &str, fallback: glow::NativeTexture| {
+                match (pipe.view_tex(label), pipe.view_program(label)) {
+                    (Some(t), Some(p)) => pipe.blit_region(gl, t, p, 0, 0, ww, wh),
+                    _ => pipe.blit_to_screen(gl, fallback, ww, wh),
+                }
+            };
             match self.view {
                 ViewMode::Upscaled => {
-                    let tex = if self.show_pre { pipe.pre_sharpen_tex() } else { out_tex };
+                    // Pre-RCAS is the upscale output (the history write-tap).
+                    let tex = if self.show_pre {
+                        pipe.pre_sharpen_tex()
+                    } else {
+                        out_tex
+                    };
                     pipe.blit_to_screen(gl, tex, ww, wh)
                 }
                 ViewMode::Native => {
@@ -423,23 +449,9 @@ impl App {
                     pipe.blit_region(gl, pipe.scene_color_tex(), pipe.blit_prog(), 0, 0, ww / 2, wh);
                     pipe.blit_region(gl, out_tex, pipe.blit_prog(), ww / 2, 0, ww - ww / 2, wh);
                 }
-                ViewMode::Motion => {
-                    if let Some(d) = pipe.data_tex_debug() {
-                        pipe.blit_region(gl, d, pipe.motion_prog(), 0, 0, ww, wh);
-                    } else {
-                        pipe.blit_to_screen(gl, out_tex, ww, wh);
-                    }
-                }
-                ViewMode::Luma => {
-                    pipe.blit_region(gl, pipe.luma_tex_debug(), pipe.luma_prog(), 0, 0, ww, wh);
-                }
-                ViewMode::Clip => {
-                    if let Some(d) = pipe.data_tex_debug() {
-                        pipe.blit_region(gl, d, pipe.clip_prog(), 0, 0, ww, wh);
-                    } else {
-                        pipe.blit_to_screen(gl, out_tex, ww, wh);
-                    }
-                }
+                ViewMode::Motion => blit_view("motion", out_tex),
+                ViewMode::Luma => blit_view("luma", out_tex),
+                ViewMode::Clip => blit_view("clip", out_tex),
             }
         }
 
@@ -521,9 +533,9 @@ impl App {
         let path = self
             .pipeline
             .as_ref()
-            .map(|p| if p.use_compute { "compute" } else { "fragment" })
+            .map(|p| if p.use_compute() { "compute" } else { "fragment" })
             .unwrap_or("?");
-        let passes = if self.pipeline.as_ref().map(|p| p.three_pass && p.use_compute).unwrap_or(false) {
+        let passes = if self.pipeline.as_ref().map(|p| p.three_pass() && p.use_compute()).unwrap_or(false) {
             3
         } else {
             2
@@ -537,7 +549,7 @@ impl App {
             "[testbed] view={} scale={:.2} sharp={:.2}{} ({}x{}->{}x{}) path={} passes={} {}",
             self.view.name(),
             self.scale,
-            self.pipeline.as_ref().map(|p| p.sharpness).unwrap_or(0.0),
+            self.pipeline.as_ref().map(|p| p.sharpness()).unwrap_or(0.0),
             if self.show_pre { " pre" } else { "" },
             rw,
             rh,
@@ -584,11 +596,11 @@ impl App {
             }
             KeyCode::KeyF => {
                 if let Some(p) = self.pipeline.as_mut() {
-                    if p.use_compute {
-                        p.use_compute = false;
+                    if p.use_compute() {
+                        p.set_compute(false);
                         eprintln!("[testbed] forced fragment path");
                     } else if p.can_compute() {
-                        p.use_compute = true;
+                        p.set_compute(true);
                         p.needs_reset = true;
                         self.same_camera = 0;
                         eprintln!("[testbed] compute path");
@@ -600,10 +612,10 @@ impl App {
             }
             KeyCode::KeyT => {
                 if let Some(p) = self.pipeline.as_mut() {
-                    p.three_pass = !p.three_pass;
+                    p.set_three_pass(!p.three_pass());
                     p.needs_reset = true;
                     self.same_camera = 0;
-                    eprintln!("[testbed] three_pass={}", p.three_pass);
+                    eprintln!("[testbed] three_pass={}", p.three_pass());
                 }
                 self.print_status();
             }
@@ -620,13 +632,13 @@ impl App {
             }
             KeyCode::KeyZ => {
                 if let Some(p) = self.pipeline.as_mut() {
-                    p.sharpness = (p.sharpness - 0.1).max(0.0);
+                    let s = p.sharpness(); p.set_sharpness((s - 0.1).max(0.0));
                 }
                 self.print_status();
             }
             KeyCode::KeyX => {
                 if let Some(p) = self.pipeline.as_mut() {
-                    p.sharpness = (p.sharpness + 0.1).min(1.0);
+                    let s = p.sharpness(); p.set_sharpness((s + 0.1).min(1.0));
                 }
                 self.print_status();
             }
@@ -754,8 +766,15 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let no_vsync = has("--no-vsync");
     let cpu_times = has("--cpu-times");
+    let fixed_dt = args
+        .iter()
+        .position(|a| a == "--fixed-dt")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f32>().ok())
+        .filter(|v| *v > 0.0);
     let mut app = App::new(force_fallback, three_pass, selftest, dump_path, debug_events, no_vsync);
     app.cpu_times = cpu_times;
+    app.fixed_dt = fixed_dt;
     app.view = init_view;
     if let Some(sp) = args
         .iter()

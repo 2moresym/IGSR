@@ -1,75 +1,144 @@
-//! Live IGSR pipeline (own code): owns every FBO/texture, runs
-//! convert → [activate] → upscale each frame with history ping-pong, and
-//! blits the result to the window. Fragment path always available; compute
-//! path used when the backend reports compute support (verbatim the stage-1
-//! fallback contract). 3-pass activate needs compute (it is compute-only);
-//! with `--three-pass` on a fragment-only backend we log once and run 2-pass.
+//! Pipeline framework (stage 11) — the orchestrator that replaces the
+//! hand-written per-pass blocks in the old `execute()`.
+//!
+//! Responsibilities, all generic:
+//! - compile every pass's compute/fragment programs + view programs
+//! - allocate and own every resource passes declare (ping-pong, scratch,
+//!   external), reallocating on resize
+//! - per frame: pick each pass's variant, resolve declared reads/writes,
+//!   bind the FBO or image units, dispatch, flip ping-pong pairs
+//! - per-pass timer queries via name registration (not a hardcoded enum)
+//! - collect debug views offered by passes, resolved against the resource
+//!   table at display time
+//!
+//! The algorithm (shaders, blend math, reset semantics) is untouched:
+//! this file only re-expresses control flow. Regression bar is pixel-equal
+//! captures vs the pre-refactor build.
 
 use glow::HasContext as _;
-use igsr::backend::gl as gl_backend;
-use igsr_sys::IgsrParamsFfi;
+use std::collections::HashMap;
 
-const BLIT_FRAG: &str = "#version 420 core
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 o_col;
-uniform sampler2D u_tex;
-void main() {
-    o_col = vec4(texture(u_tex, v_uv).rgb, 1.0);
-}
-";
+use super::passes::{Pass, PassConfig, PassCtx, PassIo, Variant};
 
-// Debug view: convert motion/disocclusion buffer. Motion is shown in
-// render-resolution pixels per frame (±4px maps red/green around
-// mid-grey); disocclusion goes to blue. Static + attached pixels read
-// (0.5,0.5,0).
-const MOTION_FRAG: &str = "#version 420 core
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 o_col;
-uniform sampler2D u_tex;
-uniform vec2 u_render_size;
-void main() {
-    vec4 d = texture(u_tex, v_uv);
-    vec2 px = d.xy * u_render_size * 0.25;
-    o_col = vec4(clamp(px * 0.5 + 0.5, 0.0, 1.0), d.z, 1.0);
-}
-";
-
-// Debug view: luma history (R = luma grey, G = signed delta as red/blue).
-// All black in 2-pass mode (no luma tracking) — that itself is the signal.
-const LUMA_FRAG: &str = "#version 420 core
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 o_col;
-uniform sampler2D u_tex;
-void main() {
-    vec2 l = texture(u_tex, v_uv).rg;
-    float d = clamp(l.y * 8.0, -0.5, 0.5);
-    o_col = vec4(l.x + d, l.x - abs(d) * 0.5, l.x - d, 1.0);
-}
-";
-
-// Debug view: activate output (combined disocclusion clip as green, luma
-// edge flag as red). Reads the same buffer the motion view reads, so in
-// 3-pass mode Motion shows (motion, combined clip) while this shows
-// (edge, clip). Black in 2-pass mode (activate never runs).
-const CLIP_FRAG: &str = "#version 420 core
-layout(location = 0) in vec2 v_uv;
-layout(location = 0) out vec4 o_col;
-uniform sampler2D u_tex;
-void main() {
-    vec4 d = texture(u_tex, v_uv);
-    o_col = vec4(d.w, d.z, 0.0, 1.0);
-}
-";
-
-fn f32_bytes(v: &[f32]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 4) }
+#[derive(Debug, Clone, Copy)]
+pub enum SizeDomain {
+    Render,
+    Display,
 }
 
-// ---- Per-pass GPU timers (stage 8A) ----
+#[derive(Debug, Clone, Copy)]
+pub enum ResourceKind {
+    /// Produced outside the framework (testbed scene pass). Registered
+    /// per frame via `set_external`.
+    External,
+    /// Write-only per frame; no cross-frame role.
+    Scratch,
+    /// Stateful pair. Flips after any pass writes it. Ownership is
+    /// expressed by a pass writing the name — the table never knows or
+    /// cares which pass is stateful.
+    PingPong { taps: usize },
+}
 
-/// Passes we time. Order matches the report and the ms/valid/ema arrays.
-/// `Total` brackets the whole execute (the only trustworthy number when the
-/// driver mis-reports individual compute passes — see PROFILING_HD4000.md).
+/// A resource a pass declares. The framework allocates exactly one of
+/// each unique name across the whole pipeline.
+#[derive(Debug, Clone, Copy)]
+pub struct ResourceSpec {
+    pub name: &'static str,
+    pub kind: ResourceKind,
+    pub internal: i32,
+    pub upload_format: u32,
+    pub upload_type: u32,
+    pub domain: SizeDomain,
+    pub filter: u32,
+}
+
+struct ResourceEntry {
+    spec: ResourceSpec,
+    tex: Vec<glow::NativeTexture>,
+    fbo: Vec<glow::NativeFramebuffer>,
+    /// Ping-pong read tap; scratch always 0.
+    read: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sizes {
+    pub render: (u32, u32),
+    pub display: (u32, u32),
+}
+
+impl Sizes {
+    pub fn dims(&self, d: SizeDomain) -> (u32, u32) {
+        match d {
+            SizeDomain::Render => self.render,
+            SizeDomain::Display => self.display,
+        }
+    }
+}
+
+// ---- Shared texture helper (used by framework + passes) ----
+
+pub fn make_tex(
+    gl: &glow::Context,
+    internal: i32,
+    w: i32,
+    h: i32,
+    upload_format: u32,
+    upload_type: u32,
+    upload: Option<&[u8]>,
+    filter: u32,
+) -> glow::NativeTexture {
+    unsafe {
+        let t = gl.create_texture().unwrap();
+        gl.bind_texture(glow::TEXTURE_2D, Some(t));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, internal, w, h, 0, upload_format, upload_type,
+            glow::PixelUnpackData::Slice(upload),
+        );
+        t
+    }
+}
+
+/// A view offered by a pass: a label, the logical resource it displays,
+/// and the fragment shader that visualizes it.
+pub struct ViewEntry {
+    pub label: &'static str,
+    pub source: &'static str,
+    pub program: glow::NativeProgram,
+}
+
+pub struct Pipeline {
+    passes: Vec<Box<dyn Pass>>,
+    res: Vec<ResourceEntry>,
+    /// Programs per pass: [compute, fragment]. `None` = didn't compile.
+    progs: Vec<[Option<glow::NativeProgram>; 2]>,
+    /// Whether a pass is compiled/run at all this configuration.
+    enabled: Vec<bool>,
+    variant: Vec<Variant>,
+    locs: HashMap<(usize, String), Option<glow::NativeUniformLocation>>,
+    views: Vec<ViewEntry>,
+    timers: PassTimers,
+    sizes: Sizes,
+    cfg: PassConfig,
+    pub needs_reset: bool,
+    // External scene targets owned by the testbed, bridged into the table.
+    scene_fbo: glow::NativeFramebuffer,
+    scene_rb: Option<glow::Renderbuffer>,
+    scene_color: glow::NativeTexture,
+    scene_vel: glow::NativeTexture,
+    scene_depth: glow::NativeTexture,
+    blit_prog: glow::NativeProgram,
+    blit_vao: glow::NativeVertexArray,
+    _blit_vbo: glow::NativeBuffer,
+    timer_supported: bool,
+    timer_frame: u64,
+}
+
+// ---- Per-pass timer queries, generalized by name registration ----
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PassId {
     Convert = 0,
@@ -82,11 +151,6 @@ pub enum PassId {
 
 const N_TIMED: usize = 6;
 
-/// GL_ARB_timer_query instrumentation with 3 in-flight slots per pass, so
-/// results are consumed 1–2 frames late and never stall the pipeline.
-/// `u32` nanosecond reads are used deliberately: per-pass times are
-/// millisecond-scale (no wrap risk below ~4s), which avoids glow's awkward
-/// pointer-based u64 getter.
 pub struct PassTimers {
     supported: bool,
     slots: [[Option<glow::NativeQuery>; 3]; N_TIMED],
@@ -95,8 +159,8 @@ pub struct PassTimers {
     ms: [f32; N_TIMED],
     ema_ms: [f32; N_TIMED],
     valid: [bool; N_TIMED],
-    /// Bit p set = pass p is skipped this frame. The driver gets at most
-    /// one active query per frame (see PROFILING_HD4000.md §2).
+    /// Bit p set = pass p skipped this frame (one active query per frame;
+    /// nested TIME_ELAPSED queries mis-report on crocus — stage 8A).
     mask: u8,
 }
 
@@ -130,12 +194,6 @@ impl PassTimers {
         }
         t
     }
-
-    pub fn supported(&self) -> bool {
-        self.supported
-    }
-
-    /// Start timing `pass`. No-op when masked (another pass owns this frame).
     pub unsafe fn begin(&mut self, gl: &glow::Context, pass: PassId) {
         if !self.supported || (self.mask & (1 << pass as u8)) != 0 {
             return;
@@ -150,9 +208,6 @@ impl PassTimers {
             }
         }
     }
-
-    /// Stop timing. Same mask rule as begin (a skipped begin must pair
-    /// with a skipped end — the pair always matches by construction).
     pub unsafe fn end(&self, gl: &glow::Context, pass: PassId) {
         if !self.supported || (self.mask & (1 << pass as u8)) != 0 {
             return;
@@ -161,9 +216,6 @@ impl PassTimers {
             gl.end_query(glow::TIME_ELAPSED);
         }
     }
-
-    /// Harvest available results without blocking. Call once per frame
-    /// (start of execute); updates last + EMA milliseconds per pass.
     pub unsafe fn poll(&mut self, gl: &glow::Context) {
         if !self.supported {
             return;
@@ -192,15 +244,10 @@ impl PassTimers {
             }
         }
     }
-
     pub fn ema(&self, pass: PassId) -> Option<f32> {
         let v = self.valid[pass as usize];
         v.then_some(self.ema_ms[pass as usize])
     }
-
-    /// One-line overlay fragment, e.g. `gpu=[convert 0.42ms activate -- upscale 1.10ms
-    /// total 1.60ms]`. Activate is shown only once it has produced a sample
-    /// (3-pass runs).
     pub fn report(&self) -> String {
         format_report(
             self.supported,
@@ -212,8 +259,6 @@ impl PassTimers {
             self.ema(PassId::Scene),
         )
     }
-
-    /// Whether `pass` owns this frame's query slot (rotation scheme).
     pub fn timer_armed(&self, pass: PassId) -> bool {
         self.supported && (self.mask & (1 << pass as u8)) == 0
     }
@@ -225,7 +270,6 @@ impl PassTimers {
     }
 }
 
-/// Pure report formatting (unit-tested without GL).
 fn format_report(
     supported: bool,
     convert_ms: Option<f32>,
@@ -240,8 +284,6 @@ fn format_report(
     }
     let mut s = String::from("gpu=[");
     s.push_str(&format!("convert {} ", fmt_ms(convert_ms)));
-    // Always shown (2-pass runs read `--`): an absent activate must be
-    // visibly absent, not silently missing (stage 10 step 1).
     s.push_str(&format!("activate {} ", fmt_ms(activate_ms)));
     s.push_str(&format!("upscale {} ", fmt_ms(upscale_ms)));
     s.push_str(&format!("sharp {} ", fmt_ms(sharp_ms)));
@@ -254,6 +296,572 @@ fn fmt_ms(v: Option<f32>) -> String {
     match v {
         Some(ms) => format!("{ms:.2}ms"),
         None => "--".into(),
+    }
+}
+
+impl Pipeline {
+    pub unsafe fn new(
+        gl: &glow::Context,
+        gl_major: u32,
+        gl_minor: u32,
+        backend_compute: bool,
+        three_pass: bool,
+        timer_supported: bool,
+        rw: u32,
+        rh: u32,
+        dw: u32,
+        dh: u32,
+    ) -> Result<Pipeline, String> {
+        unsafe {
+            // The default pipeline: today's four passes, in order. Adding a
+            // pass later = one `passes::` file + one line here; nothing else
+            // in the framework changes.
+            let passes: Vec<Box<dyn Pass>> = vec![
+                Box::new(super::passes::convert::Convert::new()),
+                Box::new(super::passes::activate::Activate::new()),
+                Box::new(super::passes::upscale::Upscale::new()),
+                Box::new(super::passes::sharpen::Sharpen::new()),
+            ];
+            let mut p = Pipeline {
+                passes,
+                res: Vec::new(),
+                progs: Vec::new(),
+                enabled: Vec::new(),
+                variant: Vec::new(),
+                locs: HashMap::new(),
+                views: Vec::new(),
+                timers: PassTimers::new(gl, timer_supported),
+                sizes: Sizes { render: (rw, rh), display: (dw, dh) },
+                cfg: PassConfig::new(backend_compute, three_pass),
+                needs_reset: true,
+                scene_fbo: gl.create_framebuffer().unwrap(),
+                scene_rb: None,
+                scene_color: gl.create_texture().unwrap(),
+                scene_vel: gl.create_texture().unwrap(),
+                scene_depth: gl.create_texture().unwrap(),
+                blit_prog: gl.create_program().unwrap(),
+                blit_vao: gl.create_vertex_array().unwrap(),
+                _blit_vbo: gl.create_buffer().unwrap(),
+                timer_supported,
+                timer_frame: 0,
+            };
+            p.compile_pass_programs(gl, gl_major, gl_minor, backend_compute);
+            p.compile_view_programs(gl);
+            p.build_blit(gl);
+            p.resize(gl, rw, rh, dw, dh);
+            p.resolve_variants();
+            Ok(p)
+        }
+    }
+
+    /// Compile both variants of every pass (compute body gets the version
+    /// prelude). A variant that fails leaves `None`; the variant chooser
+    /// falls back to the other one (the stage-1 contract).
+    unsafe fn compile_pass_programs(
+        &mut self,
+        gl: &glow::Context,
+        _maj: u32,
+        _min: u32,
+        backend_compute: bool,
+    ) {
+        {
+            let prelude = igsr::backend::gl::compute_prelude(_maj, _min, backend_compute);
+            for pass in &self.passes {
+                let mut pair = [None, None];
+                let variants = pass.variants();
+                if variants.compute {
+                    if let Some(pre) = prelude {
+                        if let Some((_, body)) = pass.sources(Variant::Compute) {
+                            let src = format!("{pre}{body}");
+                            pair[0] = igsr::backend::gl::compile_compute(gl, &src).ok();
+                        }
+                    }
+                }
+                if variants.fragment {
+                    if let Some((vs, fs)) = pass.sources(Variant::Fragment) {
+                        pair[1] = igsr::backend::gl::compile_program(gl, vs, fs).ok();
+                    }
+                }
+                self.progs.push(pair);
+                self.enabled.push(false);
+                self.variant.push(Variant::Fragment);
+            }
+        }
+    }
+
+    unsafe fn compile_view_programs(&mut self, gl: &glow::Context) {
+        {
+            for pass in &self.passes {
+                for vs in pass.debug_views() {
+                    match igsr::backend::gl::compile_program(
+                        gl,
+                        igsr_shaders::FULLSCREEN_VERT,
+                        vs.frag,
+                    ) {
+                        Ok(program) => {
+                            self.views.push(ViewEntry { label: vs.label, source: vs.source, program })
+                        }
+                        Err(e) => {
+                            eprintln!("[pipeline] view {} failed to compile: {e}", vs.label);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    unsafe fn build_blit(&mut self, gl: &glow::Context) {
+        unsafe {
+            const BLIT_FRAG: &str = "#version 420 core
+layout(location = 0) in vec2 v_uv;
+layout(location = 0) out vec4 o_col;
+uniform sampler2D u_tex;
+void main() { o_col = vec4(texture(u_tex, v_uv).rgb, 1.0); }
+";
+            let p = igsr::backend::gl::compile_program(
+                gl,
+                igsr_shaders::FULLSCREEN_VERT,
+                BLIT_FRAG,
+            )
+            .expect("blit program");
+            let verts: [f32; 12] = [-1.0, -1.0, 0.0, 0.0, 3.0, -1.0, 2.0, 0.0, -1.0, 3.0, 0.0, 2.0];
+            let vbo = gl.create_buffer().unwrap();
+            gl.bind_vertex_array(Some(self.blit_vao));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                std::slice::from_raw_parts(verts.as_ptr() as *const u8, verts.len() * 4),
+                glow::STATIC_DRAW,
+            );
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 4 * 4, 0);
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 4 * 4, 2 * 4);
+            gl.enable_vertex_attrib_array(1);
+            gl.bind_vertex_array(None);
+            self._blit_vbo = vbo;
+            self.blit_prog = p;
+        }
+    }
+
+    /// Allocate/refresh every declared resource + external scene targets.
+    pub unsafe fn resize(&mut self, gl: &glow::Context, rw: u32, rh: u32, dw: u32, dh: u32) {
+        unsafe {
+            self.sizes = Sizes { render: (rw, rh), display: (dw, dh) };
+            let sharpness = self.cfg.sharpness;
+            self.cfg = PassConfig::new(self.cfg.use_compute, self.cfg.three_pass);
+            self.cfg.sharpness = sharpness;
+            self.build_scene_targets(gl, rw, rh);
+            self.build_resources(gl);
+            self.needs_reset = true;
+            self.timer_frame = 0;
+            self.resolve_variants();
+        }
+    }
+
+    unsafe fn build_scene_targets(&mut self, gl: &glow::Context, rw: u32, rh: u32) {
+        unsafe {
+            let none: Option<&[u8]> = None;
+            self.scene_color = make_tex(
+                gl, glow::RGBA8 as i32, rw as i32, rh as i32,
+                glow::RGBA, glow::UNSIGNED_BYTE, none, glow::NEAREST,
+            );
+            self.scene_vel = make_tex(
+                gl, glow::RG32F as i32, rw as i32, rh as i32,
+                glow::RG, glow::FLOAT, none, glow::NEAREST,
+            );
+            self.scene_depth = make_tex(
+                gl, glow::R32F as i32, rw as i32, rh as i32,
+                glow::RED, glow::FLOAT, none, glow::NEAREST,
+            );
+            let rb = gl.create_renderbuffer().unwrap();
+            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rb));
+            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH_COMPONENT24, rw as i32, rh as i32);
+            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
+            if let Some(old) = self.scene_rb.replace(rb) {
+                gl.delete_renderbuffer(old);
+            }
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.scene_fbo));
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.scene_color), 0);
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, Some(self.scene_vel), 0);
+            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT2, glow::TEXTURE_2D, Some(self.scene_depth), 0);
+            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::RENDERBUFFER, Some(rb));
+            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1, glow::COLOR_ATTACHMENT2]);
+            assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE, "scene FBO incomplete");
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+    }
+
+    /// (Re)allocate the union of all pass resource declarations.
+    unsafe fn build_resources(&mut self, gl: &glow::Context) {
+        unsafe {
+            for e in &self.res {
+                for t in &e.tex {
+                    gl.delete_texture(*t);
+                }
+                for f in &e.fbo {
+                    gl.delete_framebuffer(*f);
+                }
+            }
+            self.res.clear();
+            // Collect unique specs across all passes.
+            for pass in &self.passes {
+                for spec in pass.resources() {
+                    if self.res.iter().any(|e| e.spec.name == spec.name) {
+                        continue;
+                    }
+                    let (w, h) = self.sizes.dims(spec.domain);
+                    let taps = match spec.kind {
+                        ResourceKind::External | ResourceKind::Scratch => 1,
+                        ResourceKind::PingPong { taps } => taps,
+                    };
+                    let mut tex = Vec::with_capacity(taps);
+                    let mut fbo = Vec::with_capacity(taps);
+                    let (aw, ah) = match spec.kind {
+                        // Externals are replaced wholesale by set_external
+                        // each frame; allocate a 1x1 slot, not full-size.
+                        ResourceKind::External => (1, 1),
+                        _ => (w as i32, h as i32),
+                    };
+                    for _ in 0..taps {
+                        let t = make_tex(
+                            gl, spec.internal, aw, ah,
+                            spec.upload_format, spec.upload_type, None, spec.filter,
+                        );
+                        tex.push(t);
+                        let f = gl.create_framebuffer().unwrap();
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(f));
+                        gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(t), 0);
+                        gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
+                        assert_eq!(
+                            gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                            glow::FRAMEBUFFER_COMPLETE
+                        );
+                        fbo.push(f);
+                    }
+                    self.res.push(ResourceEntry { spec: *spec, tex, fbo, read: 0 });
+                }
+            }
+            // Clear the render-res debug-visible pairs (data/luma) to black,
+            // exactly as the pre-refactor resize did, so 2-pass views read
+            // defined memory rather than garbage.
+            for name in ["luma"] {
+                if let Some(e) = self.res.iter_mut().find(|e| e.spec.name == name) {
+                    for f in e.fbo.iter() {
+                        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(*f));
+                        gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                        gl.clear(glow::COLOR_BUFFER_BIT);
+                    }
+                }
+            }
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        }
+    }
+
+    /// Register a texture the testbed scene produced this frame.
+    pub fn set_external(&mut self, name: &str, tex: glow::NativeTexture) {
+        if let Some(e) = self.res.iter_mut().find(|e| e.spec.name == name) {
+            if e.tex.is_empty() {
+                e.tex.push(tex);
+            } else {
+                e.tex[0] = tex;
+            }
+        }
+    }
+
+    fn res_idx(&self, name: &str) -> Option<usize> {
+        self.res.iter().position(|e| e.spec.name == name)
+    }
+
+    /// Read handle for a name (ping-pong current tap).
+    fn read_tex(&self, name: &str) -> Option<glow::NativeTexture> {
+        let e = self.res.get(self.res_idx(name)?)?;
+        e.tex.get(e.read).copied()
+    }
+
+    /// Write tap index + handle for a name (ping-pong next tap, or 0).
+    fn write_tex(&self, name: &str) -> Option<(usize, glow::NativeTexture)> {
+        let e = self.res.get(self.res_idx(name)?)?;
+        let idx = match e.spec.kind {
+            ResourceKind::PingPong { taps } => (e.read + 1) % taps,
+            _ => 0,
+        };
+        e.tex.get(idx).copied().map(|t| (idx, t))
+    }
+
+    /// Resolve a debug view's logical resource to its current read handle.
+    pub fn view_tex(&self, label: &str) -> Option<glow::NativeTexture> {
+        let v = self.views.iter().find(|v| v.label == label)?;
+        self.read_tex(v.source)
+    }
+    /// The visualizer program a pass offered for `label`.
+    pub fn view_program(&self, label: &str) -> Option<glow::NativeProgram> {
+        self.views.iter().find(|v| v.label == label).map(|v| v.program)
+    }
+    /// The unsharpened frame (upscale output) for the before/after toggle.
+    pub fn pre_sharpen_tex(&self) -> glow::NativeTexture {
+        self.read_tex("history").unwrap_or(self.scene_color)
+    }
+
+    /// Start a frame's timer rotation. Must be called before the scene
+    /// pass (which also times itself) — see `PassTimers::begin` for why
+    /// only one query may be active per frame on this driver.
+    pub fn begin_frame(&mut self) {
+        const ALL: u8 = 0b111111;
+        self.timers.mask = match self.timer_frame % 6 {
+            0 => ALL & !(1 << PassId::Convert as u8),
+            1 => ALL & !(1 << PassId::Upscale as u8),
+            2 => ALL & !(1 << PassId::Activate as u8),
+            3 => ALL & !(1 << PassId::Total as u8),
+            4 => ALL & !(1 << PassId::Sharp as u8),
+            _ => ALL & !(1 << PassId::Scene as u8),
+        };
+        self.timer_frame += 1;
+    }
+
+    /// Decide, per pass, whether it runs and on which variant. Called on
+    /// resize / config change (cheap; not per frame).
+    fn resolve_variants(&mut self) {
+        let cfg = self.cfg;
+        for (i, pass) in self.passes.iter().enumerate() {
+            let enabled_by_cfg = pass.enabled(&cfg);
+            let [comp, frag] = self.progs[i];
+            let has = comp.is_some() || frag.is_some();
+            self.enabled[i] = enabled_by_cfg && has;
+            // Prefer compute when available; fall back to fragment. A
+            // compute-only pass with no compute program is disabled.
+            self.variant[i] = if comp.is_some() { Variant::Compute } else { Variant::Fragment };
+        }
+    }
+
+    pub fn set_compute(&mut self, on: bool) {
+        self.cfg.use_compute = on;
+        self.resolve_variants();
+    }
+    pub fn set_three_pass(&mut self, on: bool) {
+        self.cfg.three_pass = on;
+        self.resolve_variants();
+    }
+
+    /// Run the whole pipeline for one frame. Returns the final output
+    /// texture (the last pass's `final_output`).
+    pub unsafe fn run(
+        &mut self,
+        gl: &glow::Context,
+        params: &igsr_sys::IgsrParamsFfi,
+    ) -> glow::NativeTexture {
+        unsafe {
+            // Scene targets are external inputs to convert/activate/upscale.
+            let sc = self.scene_color;
+            let sv = self.scene_vel;
+            let sd = self.scene_depth;
+            self.set_external("color", sc);
+            self.set_external("velocity", sv);
+            self.set_external("depth", sd);
+
+            self.timers.poll(gl);
+            self.timers.begin(gl, PassId::Total);
+
+            let mut final_tex = sc;
+            for i in 0..self.passes.len() {
+                if !self.enabled[i] {
+                    continue;
+                }
+                let io: PassIo = self.passes[i].io();
+                let variant = self.variant[i];
+                let idx = match variant {
+                    Variant::Compute => 0,
+                    Variant::Fragment => 1,
+                };
+                let prog = self.progs[i][idx];
+
+                // Resolve reads (before this pass's writes).
+                let mut reads = Vec::with_capacity(io.reads.len());
+                for r in io.reads {
+                    reads.push(self.read_tex(r).unwrap_or(sc));
+                }
+                // Resolve write targets.
+                let mut writes = Vec::with_capacity(io.writes.len());
+                for wname in io.writes {
+                    writes.push(self.write_tex(wname));
+                }
+
+                // Bind the render target for this variant.
+                match variant {
+                    Variant::Compute => {
+                        // Bind each declared write as an image unit, in
+                        // declaration order (the shaders' binding = index).
+                        for (i, wname) in io.writes.iter().enumerate() {
+                            if let Some((_, tex)) = writes.get(i).copied().flatten() {
+                                let fmt = self
+                                    .res
+                                    .get(self.res_idx(wname).unwrap())
+                                    .map(|e| e.spec.internal as u32)
+                                    .unwrap_or(glow::RGBA16F);
+                                gl.bind_image_texture(
+                                    i as u32, Some(tex), 0, false, 0,
+                                    glow::WRITE_ONLY, fmt,
+                                );
+                            }
+                        }
+                    }
+                    Variant::Fragment => {
+                        // Viewport must match the target's domain (render vs
+                        // display) — the old per-pass code set it inline.
+                        if let Some(wname) = io.writes.first() {
+                            if let Some(e) = self.res.get(self.res_idx(wname).unwrap()) {
+                                let tap = match e.spec.kind {
+                                    ResourceKind::PingPong { taps } => (e.read + 1) % taps,
+                                    _ => 0,
+                                };
+                                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(e.fbo[tap]));
+                                let (w, h) = self.sizes.dims(e.spec.domain);
+                                gl.viewport(0, 0, w as i32, h as i32);
+                            }
+                        }
+                    }
+                }
+
+                let timer_pass = match self.passes[i].name() {
+                    "convert" => Some(PassId::Convert),
+                    "activate" => Some(PassId::Activate),
+                    "upscale" => Some(PassId::Upscale),
+                    "sharpen" => Some(PassId::Sharp),
+                    _ => None,
+                };
+                if let Some(tp) = timer_pass {
+                    self.timers.begin(gl, tp);
+                }
+
+                // Bind the pass's program before any uniform upload or
+                // dispatch — the old inline code did this per pass.
+                gl.use_program(prog);
+
+                let mut ctx = PassCtx::new(gl, params, &mut self.locs);
+                ctx.set_active(prog, i * 2 + idx, variant, Some(self.blit_vao));
+                ctx.sharpness = self.cfg.sharpness;
+                ctx.reads = reads;
+                ctx.writes = writes.iter().map(|w| w.map(|(_, t)| t).unwrap_or(sc)).collect();
+                ctx.display_size = self.sizes.display;
+                ctx.render_size = self.sizes.render;
+                self.passes[i].dispatch(&mut ctx);
+                gl.use_program(None);
+
+                if let Some(tp) = timer_pass {
+                    self.timers.end(gl, tp);
+                }
+
+                // Ping-pong flips for any declared write.
+                for wname in io.writes {
+                    if let Some(e) = self.res.iter_mut().find(|e| e.spec.name == *wname) {
+                        if let ResourceKind::PingPong { taps } = e.spec.kind {
+                            e.read = (e.read + 1) % taps;
+                        }
+                    }
+                }
+
+                if let Some(fo) = io.final_output {
+                    if let Some(t) = self.read_tex(fo) {
+                        final_tex = t;
+                    }
+                }
+            }
+
+            self.timers.end(gl, PassId::Total);
+            self.needs_reset = false;
+            final_tex
+        }
+    }
+
+    // ---- public accessors preserved for main.rs ----
+    pub fn scene_fbo(&self) -> glow::NativeFramebuffer {
+        self.scene_fbo
+    }
+    pub fn render_size(&self) -> (u32, u32) {
+        self.sizes.render
+    }
+    pub fn display_size(&self) -> (u32, u32) {
+        self.sizes.display
+    }
+    pub fn use_compute(&self) -> bool {
+        self.cfg.use_compute
+    }
+    pub fn three_pass(&self) -> bool {
+        self.cfg.three_pass
+    }
+    pub fn sharpness(&self) -> f32 {
+        self.cfg.sharpness
+    }
+    pub fn set_sharpness(&mut self, s: f32) {
+        self.cfg.sharpness = s.clamp(0.0, 1.0);
+    }
+    pub fn can_compute(&self) -> bool {
+        self.progs
+            .iter()
+            .enumerate()
+            .all(|(i, p)| p[0].is_some() || !self.passes[i].enabled(&self.cfg))
+    }
+    pub fn timers_report(&self) -> String {
+        self.timers.report()
+    }
+    pub fn timers_supported(&self) -> bool {
+        self.timer_supported
+    }
+    pub fn timer_armed(&self, pass: PassId) -> bool {
+        self.timers.timer_armed(pass)
+    }
+    pub unsafe fn timer_begin(&mut self, gl: &glow::Context, pass: PassId) {
+        unsafe { self.timers.timer_begin(gl, pass) }
+    }
+    pub unsafe fn timer_end(&self, gl: &glow::Context, pass: PassId) {
+        unsafe { self.timers.timer_end(gl, pass) }
+    }
+    pub fn blit_prog(&self) -> glow::NativeProgram {
+        self.blit_prog
+    }
+    pub fn scene_color_tex(&self) -> glow::NativeTexture {
+        self.scene_color
+    }
+    /// Viewport-clipped blit with an explicit program (split-screen).
+    pub unsafe fn blit_region(
+        &self,
+        gl: &glow::Context,
+        tex: glow::NativeTexture,
+        prog: glow::NativeProgram,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) {
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+            gl.viewport(x, y, w, h);
+            gl.disable(glow::DEPTH_TEST);
+            gl.use_program(Some(prog));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+            if let Some(l) = gl.get_uniform_location(prog, "u_tex") {
+                gl.uniform_1_i32(Some(&l), 0);
+            }
+            // The motion view needs render size to express motion in
+            // render-pixels; the blit/other views don't declare it.
+            if let Some(l) = gl.get_uniform_location(prog, "u_render_size") {
+                let (rw, rh) = self.sizes.render;
+                gl.uniform_2_f32(Some(&l), rw as f32, rh as f32);
+            }
+            gl.bind_vertex_array(Some(self.blit_vao));
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+        }
+    }
+    pub unsafe fn blit_to_screen(
+        &self,
+        gl: &glow::Context,
+        tex: glow::NativeTexture,
+        w: i32,
+        h: i32,
+    ) {
+        unsafe { self.blit_region(gl, tex, self.blit_prog, 0, 0, w, h) }
     }
 }
 
@@ -275,679 +883,5 @@ mod timer_tests {
             format_report(true, Some(0.424), Some(0.1), None, None, None, None),
             "gpu=[convert 0.42ms activate 0.10ms upscale -- sharp -- scene -- total --]"
         );
-    }
-}
-
-fn tex2d(
-    gl: &glow::Context,
-    internal: i32,
-    w: i32,
-    h: i32,
-    format: u32,
-    ty: u32,
-    data: glow::PixelUnpackData,
-    filter: u32,
-) -> glow::NativeTexture {
-    unsafe {
-        let t = gl.create_texture().unwrap();
-        gl.bind_texture(glow::TEXTURE_2D, Some(t));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, filter as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, filter as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
-        gl.tex_image_2d(glow::TEXTURE_2D, 0, internal, w, h, 0, format, ty, data);
-        t
-    }
-}
-
-pub struct Pipeline {
-    pub use_compute: bool,
-    pub three_pass: bool,
-    three_warned: bool,
-    rw: u32,
-    rh: u32,
-    dw: u32,
-    dh: u32,
-    pub needs_reset: bool,
-    // Scene targets.
-    scene_fbo: glow::NativeFramebuffer,
-    scene_rb: Option<glow::Renderbuffer>,
-    scene_color: glow::NativeTexture,
-    scene_vel: glow::NativeTexture,
-    scene_depth: glow::NativeTexture,
-    // Convert targets.
-    convert_fbo: glow::NativeFramebuffer,
-    data_tex: glow::NativeTexture,
-    act_fbo: glow::NativeFramebuffer,
-    data2_tex: glow::NativeTexture,
-    luma_tex: [glow::NativeTexture; 2],
-    luma_read: usize,
-    // History ping-pong (display res).
-    hist_fbo: [glow::NativeFramebuffer; 2],
-    hist_tex: [glow::NativeTexture; 2],
-    hist_read: usize,
-    // Convert/activate output consumed by the last upscale (debug views).
-    last_data: Option<glow::NativeTexture>,
-    // Compute-path scene copy (display res; also feeds stage-6 debug views).
-    scene_out_tex: glow::NativeTexture,
-    timers: PassTimers,
-    timer_frame: u64,
-    // Sharpen post-pass (stage 9): strict post-process on the upscale
-    // output. History keeps the UNSHARPENED frame (sharpening history
-    // would feed amplified detail back into temporal accumulation).
-    sharp_fbo: glow::NativeFramebuffer,
-    sharp_tex: glow::NativeTexture,
-    sharpen_frag: glow::NativeProgram,
-    sharpen_comp: Option<glow::NativeProgram>,
-    pub sharpness: f32,
-    // Programs.
-    convert_frag: glow::NativeProgram,
-    upscale_frag: glow::NativeProgram,
-    blit_prog: glow::NativeProgram,
-    motion_prog: glow::NativeProgram,
-    luma_prog: glow::NativeProgram,
-    clip_prog: glow::NativeProgram,
-    convert_comp: Option<glow::NativeProgram>,
-    upscale_comp: Option<glow::NativeProgram>,
-    activate_comp: Option<glow::NativeProgram>,
-    blit_vao: glow::NativeVertexArray,
-    _blit_vbo: glow::NativeBuffer,
-}
-
-impl Pipeline {
-    pub unsafe fn new(
-        gl: &glow::Context,
-        gl_major: u32,
-        gl_minor: u32,
-        backend_compute: bool,
-        three_pass: bool,
-        timer_supported: bool,
-        rw: u32,
-        rh: u32,
-        dw: u32,
-        dh: u32,
-    ) -> Result<Pipeline, String> {
-        unsafe {
-            let convert_frag =
-                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, igsr_shaders::CONVERT_FRAG)?;
-            let upscale_frag =
-                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, igsr_shaders::UPSCALE_FRAG)?;
-            let blit_prog =
-                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, BLIT_FRAG)?;
-            let motion_prog =
-                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, MOTION_FRAG)?;
-            let luma_prog =
-                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, LUMA_FRAG)?;
-            let clip_prog =
-                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, CLIP_FRAG)?;
-            let sharpen_frag =
-                gl_backend::compile_program(gl, igsr_shaders::FULLSCREEN_VERT, igsr_shaders::SHARPEN_FRAG)?;
-
-            // Compute programs (prelude + body). Any failure → fragment path.
-            let prelude = gl_backend::compute_prelude(gl_major, gl_minor, backend_compute);
-            let mut use_compute = backend_compute;
-            let mut convert_comp = None;
-            let mut upscale_comp = None;
-            let mut activate_comp = None;
-            let mut sharpen_comp = None;
-            if let Some(pre) = prelude {
-                let cc = |body: &str| {
-                    let src = format!("{pre}{body}");
-                    gl_backend::compile_compute(gl, &src).ok()
-                };
-                convert_comp = cc(igsr_shaders::CONVERT_COMP);
-                upscale_comp = cc(igsr_shaders::UPSCALE_COMP);
-                activate_comp = cc(igsr_shaders::ACTIVATE_COMP);
-                sharpen_comp = cc(igsr_shaders::SHARPEN_COMP);
-                if convert_comp.is_none() || upscale_comp.is_none() {
-                    eprintln!("[pipeline] compute compile failed; using fragment path");
-                    use_compute = false;
-                }
-            } else {
-                use_compute = false;
-            }
-
-            // Shared fullscreen triangle VAO.
-            let verts: [f32; 12] = [-1.0, -1.0, 0.0, 0.0, 3.0, -1.0, 2.0, 0.0, -1.0, 3.0, 0.0, 2.0];
-            let blit_vao = gl.create_vertex_array().unwrap();
-            let blit_vbo = gl.create_buffer().unwrap();
-            gl.bind_vertex_array(Some(blit_vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(blit_vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, f32_bytes(&verts), glow::STATIC_DRAW);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 4 * 4, 0);
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(1, 2, glow::FLOAT, false, 4 * 4, 2 * 4);
-            gl.enable_vertex_attrib_array(1);
-            gl.bind_vertex_array(None);
-
-            let mut p = Pipeline {
-                use_compute,
-                three_pass,
-                three_warned: false,
-                rw: 0,
-                rh: 0,
-                dw: 0,
-                dh: 0,
-                needs_reset: true,
-                scene_fbo: gl.create_framebuffer().unwrap(),
-                scene_rb: None,
-                scene_color: gl.create_texture().unwrap(),
-                scene_vel: gl.create_texture().unwrap(),
-                scene_depth: gl.create_texture().unwrap(),
-                convert_fbo: gl.create_framebuffer().unwrap(),
-                data_tex: gl.create_texture().unwrap(),
-                act_fbo: gl.create_framebuffer().unwrap(),
-                data2_tex: gl.create_texture().unwrap(),
-                luma_tex: [gl.create_texture().unwrap(), gl.create_texture().unwrap()],
-                luma_read: 0,
-                hist_fbo: [gl.create_framebuffer().unwrap(), gl.create_framebuffer().unwrap()],
-                hist_tex: [gl.create_texture().unwrap(), gl.create_texture().unwrap()],
-                hist_read: 0,
-                last_data: None,
-                scene_out_tex: gl.create_texture().unwrap(),
-                timers: PassTimers::new(gl, timer_supported),
-                timer_frame: 0,
-                convert_frag,
-                upscale_frag,
-                blit_prog,
-                motion_prog,
-                luma_prog,
-                clip_prog,
-                convert_comp,
-                upscale_comp,
-                activate_comp,
-                sharp_fbo: gl.create_framebuffer().unwrap(),
-                sharp_tex: gl.create_texture().unwrap(),
-                sharpen_frag,
-                sharpen_comp,
-                sharpness: 0.3,
-                blit_vao,
-                _blit_vbo: blit_vbo,
-            };
-            p.resize(gl, rw, rh, dw, dh);
-            Ok(p)
-        }
-    }
-
-    /// (Re)create all targets. Marks history for reset (camera-cut path).
-    /// Old textures/renderbuffers are deleted first so live scale changes
-    /// don't leak VRAM on a 4 GB machine.
-    pub unsafe fn resize(&mut self, gl: &glow::Context, rw: u32, rh: u32, dw: u32, dh: u32) {
-        unsafe {
-            for t in [
-                self.scene_color, self.scene_vel, self.scene_depth,
-                self.data_tex, self.data2_tex, self.scene_out_tex,
-                self.sharp_tex,
-                self.luma_tex[0], self.luma_tex[1],
-                self.hist_tex[0], self.hist_tex[1],
-            ] {
-                gl.delete_texture(t);
-            }
-            if let Some(rb) = self.scene_rb.take() {
-                gl.delete_renderbuffer(rb);
-            }
-            self.rw = rw;
-            self.rh = rh;
-            self.dw = dw;
-            self.dh = dh;
-            let (rw, rh, dw, dh) = (rw as i32, rh as i32, dw as i32, dh as i32);
-            // NOTE: PixelUnpackData is not Copy; construct a fresh None per call.
-            let no_data = || glow::PixelUnpackData::Slice(None);
-
-            self.scene_color = tex2d(gl, glow::RGBA8 as i32, rw, rh, glow::RGBA, glow::UNSIGNED_BYTE, no_data(), glow::NEAREST);
-            self.scene_vel = tex2d(gl, glow::RG32F as i32, rw, rh, glow::RG, glow::FLOAT, no_data(), glow::NEAREST);
-            self.scene_depth = tex2d(gl, glow::R32F as i32, rw, rh, glow::RED, glow::FLOAT, no_data(), glow::NEAREST);
-            let rb = gl.create_renderbuffer().unwrap();
-            gl.bind_renderbuffer(glow::RENDERBUFFER, Some(rb));
-            gl.renderbuffer_storage(glow::RENDERBUFFER, glow::DEPTH_COMPONENT24, rw, rh);
-            gl.bind_renderbuffer(glow::RENDERBUFFER, None);
-            self.scene_rb = Some(rb);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.scene_fbo));
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.scene_color), 0);
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, Some(self.scene_vel), 0);
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT2, glow::TEXTURE_2D, Some(self.scene_depth), 0);
-            gl.framebuffer_renderbuffer(glow::FRAMEBUFFER, glow::DEPTH_ATTACHMENT, glow::RENDERBUFFER, Some(rb));
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0, glow::COLOR_ATTACHMENT1, glow::COLOR_ATTACHMENT2]);
-            assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE);
-
-            self.data_tex = tex2d(gl, glow::RGBA16F as i32, rw, rh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::NEAREST);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.convert_fbo));
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.data_tex), 0);
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
-            assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE);
-
-            self.data2_tex = tex2d(gl, glow::RGBA16F as i32, rw, rh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::NEAREST);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.act_fbo));
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.data2_tex), 0);
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
-            assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE);
-
-            for i in 0..2 {
-                self.luma_tex[i] = tex2d(gl, glow::RG16F as i32, rw, rh, glow::RG, glow::HALF_FLOAT, no_data(), glow::NEAREST);
-                self.hist_tex[i] = tex2d(gl, glow::RGBA16F as i32, dw, dh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::LINEAR);
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.hist_fbo[i]));
-                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.hist_tex[i]), 0);
-                gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
-                assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE);
-                // Clear histories so the first frame blends from black, not garbage.
-                gl.clear_color(0.0, 0.0, 0.0, 0.0);
-                gl.clear(glow::COLOR_BUFFER_BIT);
-            }
-            // Sharpen target (display res). No history role — never cleared
-            // for blending; every frame overwrites it fully.
-            self.sharp_tex = tex2d(gl, glow::RGBA16F as i32, dw, dh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::NEAREST);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.sharp_fbo));
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT0, glow::TEXTURE_2D, Some(self.sharp_tex), 0);
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
-            assert_eq!(gl.check_framebuffer_status(glow::FRAMEBUFFER), glow::FRAMEBUFFER_COMPLETE);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            self.luma_read = 0;
-            self.hist_read = 0;
-            self.last_data = None;
-            self.scene_out_tex =
-                tex2d(gl, glow::RGBA16F as i32, dw, dh, glow::RGBA, glow::HALF_FLOAT, no_data(), glow::NEAREST);
-            // Clear debug-visible buffers that no pass writes in 2-pass mode
-            // (activate output + luma history), so the clip/luma views read
-            // black instead of uninitialized memory. Luma has no FBO of its
-            // own; clear it through act_fbo's second attachment.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.act_fbo));
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            for i in 0..2 {
-                gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, Some(self.luma_tex[i]), 0);
-                gl.draw_buffers(&[glow::COLOR_ATTACHMENT1]);
-                gl.clear(glow::COLOR_BUFFER_BIT);
-            }
-            gl.framebuffer_texture_2d(glow::FRAMEBUFFER, glow::COLOR_ATTACHMENT1, glow::TEXTURE_2D, None, 0);
-            gl.draw_buffers(&[glow::COLOR_ATTACHMENT0]);
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            self.needs_reset = true;
-        }
-    }
-
-    pub fn scene_fbo(&self) -> glow::NativeFramebuffer {
-        self.scene_fbo
-    }
-    pub fn render_size(&self) -> (u32, u32) {
-        (self.rw, self.rh)
-    }
-
-    fn uni(gl: &glow::Context, prog: glow::NativeProgram, name: &str) -> Option<glow::NativeUniformLocation> {
-        unsafe { gl.get_uniform_location(prog, name) }
-    }
-
-    fn set_convert_uniforms(gl: &glow::Context, prog: glow::NativeProgram, p: &IgsrParamsFfi) {
-        unsafe {
-            if let Some(l) = Self::uni(gl, prog, "u_render_size") {
-                gl.uniform_2_f32(Some(&l), p.render_size[0], p.render_size[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_render_rcp") {
-                gl.uniform_2_f32(Some(&l), p.render_size_rcp[0], p.render_size_rcp[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_clip_to_prev") {
-                // Params store row-major; GLSL wants column-major → transpose.
-                gl.uniform_matrix_4_f32_slice(Some(&l), true, &p.clip_to_prev_clip);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_fov_hor") {
-                gl.uniform_1_f32(Some(&l), p.camera_fov_hor);
-            }
-        }
-    }
-
-    fn set_upscale_uniforms(gl: &glow::Context, prog: glow::NativeProgram, p: &IgsrParamsFfi) {
-        unsafe {
-            if let Some(l) = Self::uni(gl, prog, "u_render_size") {
-                gl.uniform_2_f32(Some(&l), p.render_size[0], p.render_size[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_render_rcp") {
-                gl.uniform_2_f32(Some(&l), p.render_size_rcp[0], p.render_size_rcp[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_display_size") {
-                gl.uniform_2_f32(Some(&l), p.display_size[0], p.display_size[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_display_rcp") {
-                gl.uniform_2_f32(Some(&l), p.display_size_rcp[0], p.display_size_rcp[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_jitter") {
-                gl.uniform_2_f32(Some(&l), p.jitter[0], p.jitter[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_reset") {
-                gl.uniform_1_f32(Some(&l), p.reset as f32);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_min_lerp") {
-                gl.uniform_1_f32(Some(&l), p.min_lerp_contrib);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_full_taps") {
-                gl.uniform_1_f32(Some(&l), if p.same_camera_frames >= 2 { 1.0 } else { 0.0 });
-            }
-        }
-    }
-
-    fn set_sharpen_uniforms(
-        gl: &glow::Context,
-        prog: glow::NativeProgram,
-        p: &IgsrParamsFfi,
-        sharpness: f32,
-    ) {
-        unsafe {
-            if let Some(l) = Self::uni(gl, prog, "u_display_size") {
-                gl.uniform_2_f32(Some(&l), p.display_size[0], p.display_size[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_display_rcp") {
-                gl.uniform_2_f32(Some(&l), p.display_size_rcp[0], p.display_size_rcp[1]);
-            }
-            if let Some(l) = Self::uni(gl, prog, "u_sharp") {
-                gl.uniform_1_f32(Some(&l), sharpness.clamp(0.0, 1.0));
-            }
-        }
-    }
-
-    fn bind_tex(gl: &glow::Context, unit: u32, tex: glow::NativeTexture) {
-        unsafe {
-            gl.active_texture(glow::TEXTURE0 + unit);
-            gl.bind_texture(glow::TEXTURE_2D, Some(tex));
-        }
-    }
-
-    fn barrier(gl: &glow::Context) {
-        unsafe {
-            gl.memory_barrier(
-                glow::SHADER_IMAGE_ACCESS_BARRIER_BIT | glow::TEXTURE_FETCH_BARRIER_BIT,
-            );
-        }
-    }
-
-    fn draw_full(gl: &glow::Context, vao: glow::NativeVertexArray) {
-        unsafe {
-            gl.bind_vertex_array(Some(vao));
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
-            gl.bind_vertex_array(None);
-        }
-    }
-
-    /// Run convert → [activate] → upscale. Returns the display-res output
-    /// texture (a history buffer, valid until the next execute).
-    pub unsafe fn execute(&mut self, gl: &glow::Context, p: &IgsrParamsFfi) -> glow::NativeTexture {
-        unsafe {
-            self.timers.poll(gl);
-            // One timed pass per frame, rotating Convert → Upscale →
-            // Activate → Total. Back-to-back TIME_ELAPSED queries mis-report
-            // on crocus (nested queries starve the inner ones); giving each
-            // query a whole frame keeps every reading trustworthy.
-            // EMA converges ~4x slower — acceptable for an overlay number.
-            const ALL: u8 = 0b111111;
-            self.timers.mask = match self.timer_frame % 6 {
-                0 => ALL & !(1 << PassId::Convert as u8),
-                1 => ALL & !(1 << PassId::Upscale as u8),
-                2 => ALL & !(1 << PassId::Activate as u8),
-                3 => ALL & !(1 << PassId::Total as u8),
-                4 => ALL & !(1 << PassId::Sharp as u8),
-                _ => ALL & !(1 << PassId::Scene as u8),
-            };
-            self.timer_frame += 1;
-            self.timers.begin(gl, PassId::Total);
-            let three = self.three_pass && self.use_compute && self.activate_comp.is_some();
-            if self.three_pass && !three && !self.three_warned {
-                self.three_warned = true;
-                eprintln!("[pipeline] 3-pass needs compute; running 2-pass");
-            }
-            let gx = (self.rw + 7) / 8;
-            let gy = (self.rh + 7) / 8;
-            let dx = (self.dw + 7) / 8;
-            let dy = (self.dh + 7) / 8;
-
-            // ---- Convert ----
-            if self.use_compute {
-                let prog = self.convert_comp.unwrap();
-                self.timers.begin(gl, PassId::Convert);
-                gl.use_program(Some(prog));
-                Self::bind_tex(gl, 0, self.scene_depth);
-                Self::bind_tex(gl, 1, self.scene_vel);
-                if let Some(l) = Self::uni(gl, prog, "u_depth") {
-                    gl.uniform_1_i32(Some(&l), 0);
-                }
-                if let Some(l) = Self::uni(gl, prog, "u_velocity") {
-                    gl.uniform_1_i32(Some(&l), 1);
-                }
-                Self::set_convert_uniforms(gl, prog, p);
-                gl.bind_image_texture(0, Some(self.data_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
-                gl.dispatch_compute(gx, gy, 1);
-                Self::barrier(gl);
-                self.timers.end(gl, PassId::Convert);
-                gl.use_program(None);
-            } else {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.convert_fbo));
-                gl.viewport(0, 0, self.rw as i32, self.rh as i32);
-                self.timers.begin(gl, PassId::Convert);
-                gl.use_program(Some(self.convert_frag));
-                Self::bind_tex(gl, 0, self.scene_depth);
-                Self::bind_tex(gl, 1, self.scene_vel);
-                if let Some(l) = Self::uni(gl, self.convert_frag, "u_depth") {
-                    gl.uniform_1_i32(Some(&l), 0);
-                }
-                if let Some(l) = Self::uni(gl, self.convert_frag, "u_velocity") {
-                    gl.uniform_1_i32(Some(&l), 1);
-                }
-                Self::set_convert_uniforms(gl, self.convert_frag, p);
-                Self::draw_full(gl, self.blit_vao);
-                self.timers.end(gl, PassId::Convert);
-                gl.use_program(None);
-            }
-
-            // ---- Activate (3-pass, compute-only) ----
-            let data_for_upscale = if three {
-                let prog = self.activate_comp.unwrap();
-                self.timers.begin(gl, PassId::Activate);
-                gl.use_program(Some(prog));
-                Self::bind_tex(gl, 0, self.data_tex);
-                Self::bind_tex(gl, 1, self.scene_color);
-                Self::bind_tex(gl, 2, self.luma_tex[self.luma_read]);
-                for (n, u) in [("u_data", 0), ("u_color", 1), ("u_luma_prev", 2)] {
-                    if let Some(l) = Self::uni(gl, prog, n) {
-                        gl.uniform_1_i32(Some(&l), u);
-                    }
-                }
-                if let Some(l) = Self::uni(gl, prog, "u_render_size") {
-                    gl.uniform_2_f32(Some(&l), p.render_size[0], p.render_size[1]);
-                }
-                if let Some(l) = Self::uni(gl, prog, "u_render_rcp") {
-                    gl.uniform_2_f32(Some(&l), p.render_size_rcp[0], p.render_size_rcp[1]);
-                }
-                if let Some(l) = Self::uni(gl, prog, "u_reset") {
-                    gl.uniform_1_f32(Some(&l), p.reset as f32);
-                }
-                if let Some(l) = Self::uni(gl, prog, "u_fov_hor") {
-                    gl.uniform_1_f32(Some(&l), p.camera_fov_hor);
-                }
-                let lw = 1 - self.luma_read;
-                gl.bind_image_texture(0, Some(self.data2_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
-                gl.bind_image_texture(1, Some(self.luma_tex[lw]), 0, false, 0, glow::WRITE_ONLY, glow::RG16F);
-                gl.dispatch_compute(gx, gy, 1);
-                Self::barrier(gl);
-                self.timers.end(gl, PassId::Activate);
-                gl.use_program(None);
-                self.luma_read = lw;
-                self.data2_tex
-            } else {
-                self.data_tex
-            };
-
-            // ---- Upscale ----
-            let hw = 1 - self.hist_read;
-            if self.use_compute {
-                let prog = self.upscale_comp.unwrap();
-                self.timers.begin(gl, PassId::Upscale);
-                gl.use_program(Some(prog));
-                Self::bind_tex(gl, 0, self.scene_color);
-                Self::bind_tex(gl, 1, data_for_upscale);
-                Self::bind_tex(gl, 2, self.hist_tex[self.hist_read]);
-                for (n, u) in [("u_color", 0), ("u_data", 1), ("u_history", 2)] {
-                    if let Some(l) = Self::uni(gl, prog, n) {
-                        gl.uniform_1_i32(Some(&l), u);
-                    }
-                }
-                Self::set_upscale_uniforms(gl, prog, p);
-                gl.bind_image_texture(0, Some(self.hist_tex[hw]), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
-                gl.bind_image_texture(1, Some(self.scene_out_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
-                gl.dispatch_compute(dx, dy, 1);
-                Self::barrier(gl);
-                self.timers.end(gl, PassId::Upscale);
-                gl.use_program(None);
-            } else {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.hist_fbo[hw]));
-                gl.viewport(0, 0, self.dw as i32, self.dh as i32);
-                self.timers.begin(gl, PassId::Upscale);
-                gl.use_program(Some(self.upscale_frag));
-                Self::bind_tex(gl, 0, self.scene_color);
-                Self::bind_tex(gl, 1, data_for_upscale);
-                Self::bind_tex(gl, 2, self.hist_tex[self.hist_read]);
-                for (n, u) in [("u_color", 0), ("u_data", 1), ("u_history", 2)] {
-                    if let Some(l) = Self::uni(gl, self.upscale_frag, n) {
-                        gl.uniform_1_i32(Some(&l), u);
-                    }
-                }
-                Self::set_upscale_uniforms(gl, self.upscale_frag, p);
-                Self::draw_full(gl, self.blit_vao);
-                self.timers.end(gl, PassId::Upscale);
-                gl.use_program(None);
-            }
-            self.hist_read = hw;
-            self.needs_reset = false;
-            self.last_data = Some(data_for_upscale);
-
-            // ---- Sharpen (stage 9, strict post-process) ----
-            // Reads the upscale output, writes the new final frame. History
-            // keeps the unsharpened pixels by design (see struct docs).
-            let pre = self.hist_tex[self.hist_read];
-            let use_cs = self.use_compute && self.sharpen_comp.is_some();
-            if use_cs {
-                let prog = self.sharpen_comp.unwrap();
-                self.timers.begin(gl, PassId::Sharp);
-                gl.use_program(Some(prog));
-                Self::bind_tex(gl, 0, pre);
-                if let Some(l) = Self::uni(gl, prog, "u_image") {
-                    gl.uniform_1_i32(Some(&l), 0);
-                }
-                Self::set_sharpen_uniforms(gl, prog, p, self.sharpness);
-                gl.bind_image_texture(0, Some(self.sharp_tex), 0, false, 0, glow::WRITE_ONLY, glow::RGBA16F);
-                gl.dispatch_compute(dx, dy, 1);
-                Self::barrier(gl);
-                self.timers.end(gl, PassId::Sharp);
-                gl.use_program(None);
-            } else {
-                gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.sharp_fbo));
-                gl.viewport(0, 0, self.dw as i32, self.dh as i32);
-                self.timers.begin(gl, PassId::Sharp);
-                gl.use_program(Some(self.sharpen_frag));
-                Self::bind_tex(gl, 0, pre);
-                if let Some(l) = Self::uni(gl, self.sharpen_frag, "u_image") {
-                    gl.uniform_1_i32(Some(&l), 0);
-                }
-                Self::set_sharpen_uniforms(gl, self.sharpen_frag, p, self.sharpness);
-                Self::draw_full(gl, self.blit_vao);
-                self.timers.end(gl, PassId::Sharp);
-                gl.use_program(None);
-            }
-
-            self.timers.end(gl, PassId::Total);
-            self.sharp_tex
-        }
-    }
-
-    /// The upscale output BEFORE sharpening (for the B before/after toggle).
-    /// Valid after execute(); history-identical (sharpen never feeds back).
-    pub fn pre_sharpen_tex(&self) -> glow::NativeTexture {
-        self.hist_tex[self.hist_read]
-    }
-
-    /// Blit a display-res texture to the window.
-    pub unsafe fn blit_to_screen(
-        &self,
-        gl: &glow::Context,
-        tex: glow::NativeTexture,
-        win_w: i32,
-        win_h: i32,
-    ) {
-        unsafe {
-            self.blit_region(gl, tex, self.blit_prog, 0, 0, win_w, win_h);
-        }
-    }
-
-    /// Viewport-clipped blit with an explicit program (split-screen views).
-    pub unsafe fn blit_region(
-        &self,
-        gl: &glow::Context,
-        tex: glow::NativeTexture,
-        prog: glow::NativeProgram,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-    ) {
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-            gl.viewport(x, y, w, h);
-            gl.disable(glow::DEPTH_TEST);
-            gl.use_program(Some(prog));
-            Self::bind_tex(gl, 0, tex);
-            if let Some(l) = Self::uni(gl, prog, "u_tex") {
-                gl.uniform_1_i32(Some(&l), 0);
-            }
-            // Only the motion debug program declares this; others skip it.
-            if let Some(l) = Self::uni(gl, prog, "u_render_size") {
-                gl.uniform_2_f32(Some(&l), self.rw as f32, self.rh as f32);
-            }
-            Self::draw_full(gl, self.blit_vao);
-            gl.use_program(None);
-        }
-    }
-
-    // ---- Stage-6 debug-view accessors ----
-    pub fn blit_prog(&self) -> glow::NativeProgram {
-        self.blit_prog
-    }
-    pub fn motion_prog(&self) -> glow::NativeProgram {
-        self.motion_prog
-    }
-    pub fn luma_prog(&self) -> glow::NativeProgram {
-        self.luma_prog
-    }
-    pub fn clip_prog(&self) -> glow::NativeProgram {
-        self.clip_prog
-    }
-    pub fn scene_color_tex(&self) -> glow::NativeTexture {
-        self.scene_color
-    }
-    pub fn data_tex_debug(&self) -> Option<glow::NativeTexture> {
-        self.last_data
-    }
-    pub fn luma_tex_debug(&self) -> glow::NativeTexture {
-        self.luma_tex[self.luma_read]
-    }
-    pub fn display_size(&self) -> (u32, u32) {
-        (self.dw, self.dh)
-    }
-    /// Compute dispatch is usable only if both compute programs compiled.
-    pub fn can_compute(&self) -> bool {
-        self.convert_comp.is_some() && self.upscale_comp.is_some()
-    }
-    /// Current per-pass GPU timings overlay fragment (stage 8A).
-    pub fn timers_report(&self) -> String {
-        self.timers.report()
-    }
-    /// Scene pass lives outside execute; main wraps it via these when its
-    /// rotation slot is armed (stage 10).
-    pub fn timer_armed(&self, pass: PassId) -> bool {
-        self.timers.timer_armed(pass)
-    }
-    pub unsafe fn timer_begin(&mut self, gl: &glow::Context, pass: PassId) {
-        unsafe { self.timers.timer_begin(gl, pass) }
-    }
-    pub unsafe fn timer_end(&self, gl: &glow::Context, pass: PassId) {
-        unsafe { self.timers.timer_end(gl, pass) }
-    }
-    pub fn timers_supported(&self) -> bool {
-        self.timers.supported()
     }
 }
